@@ -537,9 +537,10 @@ namespace ucache {
       }
 
       void post_io_pre_mapped_callback(Buffer* buf){
-        Buffer tmp = *buf;
-        tmp.baseVirt = mmu::phys_cast<void*>(PTE(*buf->pteRefs).phys << 12);
-        callback_implems.post_io_pre_mapped_callback_implem(&tmp);
+        void* savedVirt = buf->baseVirt;
+        buf->baseVirt = mmu::phys_cast<void*>(PTE(*buf->pteRefs).phys << 12);
+        callback_implems.post_io_pre_mapped_callback_implem(buf);
+        buf->baseVirt = savedVirt;
       }
 
       void choosePrefetchingCandidates(void* addr, PrefetchList pl){

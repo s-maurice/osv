@@ -606,7 +606,7 @@ namespace ucache {
       assert_crash(f->size > 0);
     }
     assert_crash(f != NULL);
-    vma = new VMA(align_up(f->size, pageSize), pageSize, uCacheManager->globalResidentSet, f, default_callbacks);
+    vma = new VMA(align_up(f->size, pageSize), pageSize, uCacheManager->globalResidentSet, f, default_callbacks, options);
     for(u64 i = 0; i < vma->size / vma->pageSize; i++){
       vma->buffers.push_back(new Buffer(vma->start+(i*vma->pageSize), vma->pageSize, vma));
     }
