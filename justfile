@@ -1,5 +1,5 @@
 osv_dir := justfile_directory()
-ssd_id := "c5:00.0"
+ssd_id := "c3:00.0"
 
 
 build-kernel mode="release" app="benchmarks/example/example.o":
@@ -33,7 +33,7 @@ run:
 # mem    — total physical memory given to the QEMU VM (default 8G)
 # cache  — bytes for OSv uCache; K/M/G suffix accepted (default: 50% of mem)
 # duckdb — DuckDB buffer pool limit; K/M/G suffix accepted (default: 80% of cache)
-run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="":
+run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -46,12 +46,21 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
         sleep 1
     fi
 
-    osv_env="--mount-nvme-ext --env=TPCH_QUERY={{query}} --env=TPCH_REPEAT={{repeat}} --env=UCACHE_EVICT_BATCH={{evict_batch}} --env=UCACHE_PREFETCH_BATCH={{prefetch_batch}}"
+    osv_env="--mount-nvme-ext --env=TPCH_QUERY={{query}} --env=TPCH_REPEAT={{repeat}}"
     if [ -n "{{cache}}" ]; then
         osv_env="${osv_env} --env=UCACHE_MEM={{cache}}"
     fi
     if [ -n "{{duckdb}}" ]; then
         osv_env="${osv_env} --env=DUCKDB_MEM={{duckdb}}"
+    fi
+    if [ -n "{{evict_batch}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_EVICT_BATCH={{evict_batch}}"
+    fi
+    if [ -n "{{prefetch_batch}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_PREFETCH_BATCH={{prefetch_batch}}"
+    fi
+    if [ -n "{{print}}" ]; then
+        osv_env="${osv_env} --env=TPCH_PRINT=1"
     fi
 
     # -k: PVH kernel mode — QEMU loads loader-stripped.elf directly, bypassing
@@ -105,7 +114,8 @@ build-duckdb mode="release" lto="1":
           -DDUCKDB_EXPLICIT_PLATFORM=linux_amd64 \
           -DENABLE_SANITIZER=OFF \
           -DENABLE_UBSAN=OFF \
-          -DMUSL_ENABLED=1
+          -DMUSL_ENABLED=1 \
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
     cmake --build "${duckdb_build}" \
         --target duckdb_static core_functions_extension parquet_extension duckdb_generated_extension_loader \
