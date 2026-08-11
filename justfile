@@ -135,6 +135,7 @@ build-duckdb mode="release" lto="1":
     make -j$(nproc) \
         mode={{mode}} \
         lto={{lto}} \
+        fs=ext \
         APP_OBJECTS="benchmarks/duckdb/duckdb_app.o benchmarks/duckdb/osv_ucache_file_system.o" \
         APP_LIBS="${duckdb_lib} ${core_fn_lib} ${parquet_lib} ${ext_loader_lib}" \
         EXTRA_CXXFLAGS="-I${duckdb_src}/src/include -I${duckdb_src}/third_party/concurrentqueue -I${duckdb_src}/extension/parquet/include -I${duckdb_src}/third_party/thrift" \

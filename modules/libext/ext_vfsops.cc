@@ -54,7 +54,13 @@ static int blockdev_bread_or_write(struct ext4_blockdev *bdev, void *buf, uint64
     bio->bio_offset = blk_id * bdev->bdif->ph_bsize;
     bio->bio_bcount = blk_cnt * bdev->bdif->ph_bsize;
 
-    if (!is_linear_mapped(buf)) {
+    // NVMe ignores the low two bits of a PRP address, so an unaligned target DMAs
+    // up to 3 bytes early. lwext4 hands us buf + (off & (ph_bsize - 1)).
+    static const uintptr_t dma_align = 4;
+    const bool bounce = !is_linear_mapped(buf) ||
+                        (reinterpret_cast<uintptr_t>(buf) & (dma_align - 1));
+
+    if (bounce) {
         bio->bio_data = alloc_contiguous_aligned(bio->bio_bcount, alignof(std::max_align_t));
         if (!read) {
             memcpy(bio->bio_data, buf, bio->bio_bcount);
@@ -69,7 +75,7 @@ static int blockdev_bread_or_write(struct ext4_blockdev *bdev, void *buf, uint64
     ext_debug("blockdev %s %ld bytes at offset %ld to %p with error:%d\n", read ? "read" : "wrote",
         bio->bio_bcount, bio->bio_offset, bio->bio_data, error);
 
-    if (!is_linear_mapped(buf)) {
+    if (bounce) {
         if (read && !error) {
             memcpy(buf, bio->bio_data, bio->bio_bcount);
         }
