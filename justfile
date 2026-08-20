@@ -73,6 +73,69 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
         -e "${osv_env}" \
         --pass-pci "0000:{{ssd_id}}"
 
+# Sample one TPC-H repetition with OSv's sampler and pull the profile over the gdb stub.
+# hz x seconds sampled must stay under ~7.7k samples per CPU (1 MiB trace ring); 100 Hz covers ~75 s.
+profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" hz="100" rep="" out="traces.bin" wait_s="1800":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{osv_dir}}
+
+    current_driver=$(sudo driverctl list-devices | grep "{{ssd_id}}" | awk '{print $2}')
+    if [ "${current_driver}" != "vfio-pci" ]; then
+        echo "==> Binding 0000:{{ssd_id}} to vfio-pci driver ..."
+        sudo driverctl set-override "0000:{{ssd_id}}" vfio-pci
+        sleep 1
+    fi
+
+    osv_env="--noshutdown --mount-nvme-ext --env=TPCH_QUERY={{query}} --env=TPCH_REPEAT={{repeat}}"
+    osv_env="${osv_env} --env=TPCH_SAMPLE_HZ={{hz}}"
+    if [ -n "{{rep}}" ]; then
+        osv_env="${osv_env} --env=TPCH_SAMPLE_REP={{rep}}"
+    fi
+    if [ -n "{{cache}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_MEM={{cache}}"
+    fi
+    if [ -n "{{duckdb}}" ]; then
+        osv_env="${osv_env} --env=DUCKDB_MEM={{duckdb}}"
+    fi
+    if [ -n "{{evict_batch}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_EVICT_BATCH={{evict_batch}}"
+    fi
+    if [ -n "{{prefetch_batch}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_PREFETCH_BATCH={{prefetch_batch}}"
+    fi
+
+    out="{{osv_dir}}/../{{out}}"
+    log="${out%.bin}.log"
+
+    # </dev/null: a backgrounded QEMU that touches the tty stops dead on SIGTTIN/SIGTTOU.
+    taskset -c 0-63 ./scripts/run.py -k -i build/last/loader.img \
+        -m "{{mem}}" -c "{{vcpus}}" \
+        -H -e "${osv_env}" \
+        --pass-pci "0000:{{ssd_id}}" > "${log}" 2>&1 < /dev/null &
+    vm=$!
+    # run.py does not forward signals to its QEMU child, so match on the image instead.
+    trap 'kill ${vm} 2>/dev/null || true; pkill -f "qemu-system-x86_64.*loader.img" 2>/dev/null || true' EXIT
+
+    echo "==> booting, sampling at {{hz}} Hz; waiting for the window to close (log: ${log})"
+    for _ in $(seq {{wait_s}}); do
+        grep -q "\[sampler\] window closed" "${log}" && break
+        if ! kill -0 ${vm} 2>/dev/null; then break; fi
+        sleep 1
+    done
+    if ! grep -q "\[sampler\] window closed" "${log}"; then
+        echo "!! the sampled repetition never finished — see ${log}" >&2
+        exit 1
+    fi
+
+    # The ring is frozen, so this is not a race; `monitor quit` then shuts the VM down.
+    tail -n 3 "${log}"
+    python3 scripts/trace.py extract -e build/last/loader.elf -r localhost:1234 "${out}"
+    python3 scripts/trace.py prof -e build/last/loader.elf -S "${out}" > "${out%.bin}.prof"
+    gdb build/last/loader.elf -batch -ex 'target remote localhost:1234' -ex 'monitor quit' >/dev/null 2>&1 || true
+    echo "==> ${out}  +  ${out%.bin}.prof"
+    head -n 40 "${out%.bin}.prof"
+
 # Build DuckDB as a static archive with LTO, then link it into the kernel.
 #
 # DuckDB is compiled with -flto -ffat-lto-objects so ld.bfd + the GCC LTO
@@ -84,8 +147,9 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
 # Usage:
 #   just build-duckdb            # release build with LTO
 #   just build-duckdb lto=0      # disable LTO (faster rebuild for debugging)
+#   just build-duckdb fp=1       # keep frame pointers (profilable DuckDB frames)
 #
-build-duckdb mode="release" lto="1":
+build-duckdb mode="release" lto="1" fp="0":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -97,6 +161,9 @@ build-duckdb mode="release" lto="1":
     lto_flags=""
     if [ "{{lto}}" = "1" ]; then
         lto_flags="-flto -ffat-lto-objects"
+    fi
+    if [ "{{fp}}" = "1" ]; then
+        lto_flags="${lto_flags} -fno-omit-frame-pointer"
     fi
 
     # --- Step 1: build DuckDB static library ---

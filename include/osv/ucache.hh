@@ -683,6 +683,10 @@ namespace ucache {
       // number of VMAs currently using the default (global) eviction policy
       std::atomic<u64> nb_default_policy_vmas{0};
 
+      // VMAs with a custom evict_pol, which the global sweep cannot see.
+      // Maintained by setEvictionPolicy() so evict() need not rebuild it.
+      std::vector<VMA*> custom_policy_vmas;
+
       uCache();
       void init(u64 physSize, int evict_batch, int prefetch_batch);
       ~uCache();

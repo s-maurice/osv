@@ -628,10 +628,15 @@ namespace ucache {
   void uCache::setEvictionPolicy(VMA* vma, evict_func newpol){
     bool wasDefault = (vma->callback_implems.evict_pol == global_default_transparent_eviction);
     bool nowDefault = (newpol == global_default_transparent_eviction);
-    if(wasDefault && !nowDefault)
+    if(wasDefault && !nowDefault){
       nb_default_policy_vmas.fetch_sub(1, std::memory_order_relaxed);
-    else if(!wasDefault && nowDefault)
+      custom_policy_vmas.push_back(vma);
+    }else if(!wasDefault && nowDefault){
       nb_default_policy_vmas.fetch_add(1, std::memory_order_relaxed);
+      custom_policy_vmas.erase(
+        std::remove(custom_policy_vmas.begin(), custom_policy_vmas.end(), vma),
+        custom_policy_vmas.end());
+    }
     vma->callback_implems.evict_pol = newpol;
   }
 
@@ -979,21 +984,41 @@ void uCache::evict(){
   // printf("evict: usedPhysSize=%lu MB, totalPhysSize=%lu MB\n", usedPhysSize.load()>>20, totalPhysSize>>20);
   u64 start=0,m1=0,m2=0,m3=0,end=0;
   std::vector<Buffer*> toEvict;
-  toEvict.reserve(evict_batch*1.5);
+  toEvict.reserve(evict_batch*2);
 
-  if(debug)
+  if (debug)
     start = processor::rdtsc();
-  // Also evict from VMAs with a custom eviction policy (those have their own
-  // per-VMA ResidentSet, not the globalResidentSet, so they are invisible to
-  // global_default_transparent_eviction).
-  for(const auto& p: vmas){
-    VMA* vma = p.second;
-    if(vma->callback_implems.evict_pol != global_default_transparent_eviction &&
-       (u64)toEvict.size() < evict_batch){
-      u64 still = evict_batch - toEvict.size();
-      vma->chooseEvictionCandidates(still, toEvict);
+
+  // evict from VMAs with a custom policy
+  // vmas with per-VMA resident sets are invisible to the global resident set in global_default_transparent_eviction
+  if (!custom_policy_vmas.empty()) {
+    // spread evict_batch evenly over all VMAs
+    // iterate until we have at least evict_batch pages, or run out of VMAs to evict from
+    // if we failed to evict from a VMA, don't try to evict from it again this round
+    
+    // not protected read to custom_policy_vmas
+    std::vector<VMA*> active(custom_policy_vmas.begin(), custom_policy_vmas.end());
+
+    while (!active.empty() && (u64)toEvict.size() < evict_batch) {
+      u64 share = (evict_batch - toEvict.size()) / active.size();
+      share = std::max<u64>(share, 1);
+      
+      for (size_t k = 0; k < active.size() && (u64)toEvict.size() < evict_batch; ) {
+        size_t before = toEvict.size();
+        active[k]->chooseEvictionCandidates(std::min<u64>(before + share, evict_batch), toEvict);
+
+        // check if we managed to evict from this VMA
+        if (toEvict.size() > before) {
+          k++;
+        } else {
+          // we didn't, so don't try to evict again from this VMA
+          active[k] = active.back();
+          active.pop_back();
+        }
+      }
     }
   }
+
   // 0. find candidates from the global LRU queue (all VMAs using default policy)
   if(nb_default_policy_vmas.load(std::memory_order_relaxed) > 0 &&
      (u64)toEvict.size() < evict_batch){
