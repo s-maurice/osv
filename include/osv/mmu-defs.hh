@@ -105,6 +105,8 @@ void invlpg_tlb_all(std::vector<void*>*);
 void flush_tlb_local();
 /* flush tlb for all */
 void flush_tlb_all();
+/* invlpg tlb for current processor, with provided span */
+void invlpg_tlb_local(void* const* pages, size_t count);
 
 constexpr size_t page_size_level(unsigned level)
 {

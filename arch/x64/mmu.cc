@@ -91,11 +91,32 @@ void invlpg_tlb_local(){
     }
 }
 
+void invlpg_tlb_local(void* const* pages, size_t count) {
+     for (size_t i = 0; i < count; i++) {
+        if (pages[i] != nullptr)
+            invlpg_tlb_entry(pages[i]);
+    }
+}
+
 inter_processor_interrupt tlb_invlpg_ipi{IPI_TLB_INVLPG, []{
 	  invlpg_tlb_local();
     ackTLB();
 	}
 };
+
+// same as invlpg_tlb_all, except we use INVLPGB
+// only available on some AMD
+// as guest of kvm, this is not enabled, so we cannot use it.
+// void invlpg_tlb_all_bcast(std::vector<void*>* addresses){
+//     // todo: perform the flush for ranges, reducing the calls to invlpgb.
+//     // we no longer need to pass a list of pages to flush via pages.
+//   assert(addresses != NULL);
+// 	for(size_t i=0; i<addresses->size(); i++){
+// 		if(addresses->at(i)!=NULL)
+// 			// invlpg_tlb_entry_bcast(addresses->at(i));
+
+//     // we must wait for tlbsync, using specific instruction.
+// }
 
 void invlpg_tlb_all(std::vector<void*>* addresses){
     assert(addresses->size() <= invlpg_max_pages);

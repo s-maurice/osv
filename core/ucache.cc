@@ -3,6 +3,7 @@
 #include <osv/mempool.hh>
 #include <osv/sched.hh>
 #include <osv/debug.hh>
+#include <osv/llfree_platform.h>
 
 #include <vector>
 #include <thread>
@@ -320,6 +321,7 @@ namespace ucache {
     if(bs->state != BufferState::ReadyToInsert){
       return false;
     }
+    vma->post_io_pre_mapped_callback(this);
     for(size_t i = 0; i < vma->nbPages; i++){
       PTE newPTE = PTE(bs->ptes[i].word);
       newPTE.present = 1;
@@ -476,9 +478,10 @@ namespace ucache {
 
   static u64 nextVMAid = 1; // 0 is reserved for other vmas
 
-  VMA::VMA(u64 size, u64 page_size, ResidentSet* set, ufile* f, callbacks implems):
+  VMA::VMA(u64 size, u64 page_size, ResidentSet* set, ufile* f, callbacks implems, VMAOptions* options):
     size(size), file(f), pageSize(page_size), id(nextVMAid++), residentSet(set)
   {
+    if (options) this->options = *options;
     assert_crash(isSupportedPageSize(page_size));
     bool huge = page_size == mmu::huge_page_size;
     start = createVMA(id, size, page_size, false, huge);
@@ -494,6 +497,7 @@ namespace ucache {
     callback_implems.post_EvictingToCached_callback_implem = implems.post_EvictingToCached_callback_implem;
     callback_implems.post_ReadyToInsertToCached_callback_implem = implems.post_ReadyToInsertToCached_callback_implem;
     callback_implems.misprediction_callback_implem = implems.misprediction_callback_implem;
+    callback_implems.post_io_pre_mapped_callback_implem = implems.post_io_pre_mapped_callback_implem;
     callback_implems.prefetch_pol = implems.prefetch_pol;
     callback_implems.evict_pol = implems.evict_pol;
   }
@@ -526,7 +530,68 @@ namespace ucache {
 
   uCache::~uCache(){};
 
-  VMA* uCache::mmap(const char* name, u64 req_size, u64 pageSize, ufile* file){
+  LocalLLFreeInstance::LocalLLFreeInstance(VMAOptions* vma_options) {
+    assert_crash(vma_options->isolatedPhysicalPagePool);
+
+    // round up to next power of 2. Size of the page pool.
+    auto order = memory::llf::order(vma_options->isolatedPhysicalPagePoolSize);
+    u64 num_frames = (u64)1 << order;
+
+    auto cores = sched::cpus.size();
+
+    // pool_size = num_frames * mmu::page_size;
+
+    // Allocate in 2MB chunks, llfree's max order; chunk_bases are sorted for lookup.
+    u64 num_chunks = (num_frames + CHUNK_FRAMES - 1) / CHUNK_FRAMES;
+    chunk_bases.reserve(num_chunks);
+    for (u64 i = 0; i < num_chunks; i++) {
+      chunk_bases.push_back(ucache::frames_alloc_phys_addr(CHUNK_FRAMES * mmu::page_size));
+    }
+    std::sort(chunk_bases.begin(), chunk_bases.end());
+
+    llfree_meta_size_t metadata_size = llfree_metadata_size(cores, num_frames);
+    meta.local = (uint8_t*)aligned_alloc(LLFREE_CACHE_SIZE, metadata_size.local);
+    meta.trees = (uint8_t*)aligned_alloc(LLFREE_CACHE_SIZE, metadata_size.trees);
+    meta.lower = (uint8_t*)aligned_alloc(LLFREE_CACHE_SIZE, metadata_size.lower);
+    local_llfree = (llfree_t*)aligned_alloc(LLFREE_CACHE_SIZE, metadata_size.llfree);
+
+    llfree_result_t ret = llfree_init(local_llfree, cores, num_frames, LLFREE_INIT_FREE, meta);
+    assert_crash(llfree_is_ok(ret));
+  }
+
+  LocalLLFreeInstance::~LocalLLFreeInstance() {
+    for (phys_addr base : chunk_bases)
+      ucache::frames_free_phys_addr(base, CHUNK_FRAMES * mmu::page_size);
+    free(meta.local);
+    free(meta.trees);
+    free(meta.lower);
+    free(local_llfree);
+  }
+
+  phys_addr LocalLLFreeInstance::frames_alloc_phys_addr(size_t size) {
+    size_t core = sched::cpu::current() ? sched::cpu::current()->id : 0;
+    llfree_result_t result = llfree_get(local_llfree, core, llflags(0));
+    if (llfree_is_ok(result)) {
+      // local frame f lives in chunk f/CHUNK_FRAMES at offset f%CHUNK_FRAMES within that chunk
+      return chunk_bases[result.frame / CHUNK_FRAMES] + result.frame % CHUNK_FRAMES;
+    }
+    abort("out of memory in local llfree instance");
+    assert_crash(false);
+    return 0;
+  }
+
+  void LocalLLFreeInstance::frames_free_phys_addr(phys_addr addr, size_t size) {
+    // order-9 allocations are naturally 512-page aligned, so masking recovers the chunk base
+    phys_addr chunk_base = addr & ~(phys_addr)(CHUNK_FRAMES - 1);
+    // chunk_bases is sorted, so lower_bound finds the owning chunk in O(log n)
+    auto it = std::lower_bound(chunk_bases.begin(), chunk_bases.end(), chunk_base);
+    assert_crash(it != chunk_bases.end() && *it == chunk_base);
+    u64 frame = (it - chunk_bases.begin()) * CHUNK_FRAMES + (addr & (CHUNK_FRAMES - 1));
+    llfree_result_t result = llfree_put(local_llfree, (sched::cpu::current() ? sched::cpu::current()->id : 0), frame, llflags(0));
+    assert_crash(llfree_is_ok(result));
+  }
+
+   VMA* uCache::mmap(const char* name, u64 req_size, u64 pageSize, ufile* file, VMAOptions* options){
     assert_crash(name != NULL);
     VMA* vma;
     for(auto p: vmas){
@@ -546,9 +611,15 @@ namespace ucache {
       vma->buffers.push_back(new Buffer(vma->start+(i*vma->pageSize), vma->pageSize, vma));
     }
     vmas.insert({(u64)vma->start, vma});
-    //if(debug){
-    cout << "Added a vm_area @ " << vma->start << " of size: " << vma->file->size << ", with pageSize: " << vma->pageSize << ", for file: " << name << endl;
-    //}
+
+    if(debug){
+      cout << "Added a vm_area @ " << vma->start << " of size: " << vma->file->size << ", with pageSize: " << vma->pageSize << ", for file: " << name << endl;
+    }
+
+    if (vma->options.isolatedPhysicalPagePool) {
+      vma->localLLFree.emplace(&vma->options);
+    }
+  
     this->fs->devices[0]->switch_to_poll_mode();
     return vma;
   }
@@ -686,13 +757,24 @@ namespace ucache {
       return;
     }
 
-    phys = frames_alloc_phys_addr(vma->pageSize);
-    if(debug)
+    // alloc
+    if (vma->options.isolatedPhysicalPagePool) {
+      phys = vma->localLLFree.value().frames_alloc_phys_addr(vma->pageSize);
+    } else {
+      phys = frames_alloc_phys_addr(vma->pageSize);
+    }
+
+    if(debug) {
       m3 = processor::rdtsc();
+    }
+    
     if(buffer->UncachedToInserting(phys, &bs)){
       if(debug)
         m4 = processor::rdtsc();
-      if(!newPage) { readBuffer(buffer); }
+      if(!newPage) {
+        readBuffer(buffer);
+        vma->post_io_pre_mapped_callback(buffer);
+      }
       if(debug)
         m5 = processor::rdtsc();
       assert_crash(buffer->InsertingToCached(&bs));
@@ -712,7 +794,11 @@ namespace ucache {
         percore_count[sched::cpu::current()->id]++;
       }
     }else{
-      frames_free_phys_addr(phys, vma->pageSize);
+      if (vma->options.isolatedPhysicalPagePool) {
+        vma->localLLFree.value().frames_free_phys_addr(phys, vma->pageSize);
+      } else {
+        frames_free_phys_addr(phys, vma->pageSize);
+      }
       /*while(PTE(*(buffer->pteRefs+vma->nbPages-1)).present == 0){
         _mm_pause();
         }*/
@@ -765,7 +851,15 @@ namespace ucache {
     for(Buffer* buf: pl){
       BufferSnapshot* bs = new BufferSnapshot(vma->nbPages);
       buf->updateSnapshot(bs);
-      u64 phys = frames_alloc_phys_addr(vma->pageSize);
+
+      u64 phys;
+     // alloc
+      if (vma->options.isolatedPhysicalPagePool) {
+        phys = vma->localLLFree.value().frames_alloc_phys_addr(vma->pageSize);
+      } else {
+        phys = frames_alloc_phys_addr(vma->pageSize);
+      }
+
       if(buf->UncachedToPrefetching(phys, bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
         bs->reqs = vma->file->aread(buf->baseVirt, (u64)buf->baseVirt-(u64)vma->start, vma->pageSize, false);
         buf->snap.store(bs, std::memory_order_release);
@@ -776,7 +870,12 @@ namespace ucache {
         per_cpu_inflight_count[sched::cpu::current()->id].fetch_add(1, std::memory_order_relaxed);
         assert_crash(vma->residentSet->insert(buf));
       }else{
-        frames_free_phys_addr(phys, vma->pageSize); // put back unused candidates
+        // put back unused candidates
+        if (vma->options.isolatedPhysicalPagePool) {
+          vma->localLLFree.value().frames_free_phys_addr(phys, vma->pageSize);
+        } else {
+          frames_free_phys_addr(phys, vma->pageSize);
+        }
         delete bs;
       }
     }
@@ -857,6 +956,7 @@ namespace ucache {
     */
 
 void uCache::evict(){
+  // printf("evict: usedPhysSize=%lu MB, totalPhysSize=%lu MB\n", usedPhysSize.load()>>20, totalPhysSize>>20);
   u64 start=0,m1=0,m2=0,m3=0,end=0;
   std::vector<Buffer*> toEvict;
   toEvict.reserve(evict_batch*1.5);
@@ -888,57 +988,83 @@ void uCache::evict(){
   // checking if the page have been remapped only improve performance
   // we need to settle on which pages to flush from the TLB at some point anyway
   // since we need to batch TLB eviction
+  // Another issue here, we are reserving the wrong number of entries for addressesToFlush
   std::vector<void*> addressesToFlush;
   addressesToFlush.reserve(toEvict.size());
   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](Buffer* buf) {
         BufferSnapshot* eviction_snap = buf->snap.load(std::memory_order_relaxed);
         buf->updateSnapshot(eviction_snap);
         if(!buf->vma->canBeEvicted(buf)){
-        assert_crash(buf->EvictingToCached(eviction_snap));
-        // After EvictingToCached the buffer is Cached; no concurrent prefetch possible.
-        buf->snap.store(nullptr, std::memory_order_relaxed);
-        delete eviction_snap;
-        assert_crash(buf->vma->isValidPtr(buf->baseVirt));
-        assert_crash(buf->vma->residentSet->insert(buf)); // return the page to the RS
-        return true;
+          assert_crash(buf->EvictingToCached(eviction_snap));
+          // After EvictingToCached the buffer is Cached; no concurrent prefetch possible.
+          buf->snap.store(nullptr, std::memory_order_relaxed);
+          delete eviction_snap;
+          assert_crash(buf->vma->isValidPtr(buf->baseVirt));
+          assert_crash(buf->vma->residentSet->insert(buf)); // return the page to the RS
+          return true;
         }
-        for(u64 i = 0; i < buf->vma->nbPages; i++){
-        addressesToFlush.push_back(buf->baseVirt+i*mmu::page_size);
+
+
+        // if option is given for this region, skip flushing.
+        if (buf->vma->options.skipTLBShootdown) {
+          // do the flush locally
+          flushBufferLocalTLBEntries(buf);
+        } else {
+          // regular batched global tlb flush
+          for(u64 i = 0; i < buf->vma->nbPages; i++){
+            addressesToFlush.push_back(buf->baseVirt+i*mmu::page_size);
+          }
         }
+
         return false;
         }), toEvict.end());
 
-  if(addressesToFlush.size() < mmu::invlpg_max_pages){
-    mmu::invlpg_tlb_all(&addressesToFlush);
-  }else{
-    mmu::flush_tlb_all();
+  if (addressesToFlush.size() > 0) {
+   if(addressesToFlush.size() < mmu::invlpg_max_pages){
+      mmu::invlpg_tlb_all(&addressesToFlush);
+    }else{
+      mmu::flush_tlb_all();
+    }
+    tlbFlush++;
   }
-  tlbFlush++;
-
+ 
   if(debug)
     m3 = processor::rdtsc();
 
   u64 actuallyEvictedSize = 0;
+
+  // this map is likely quite slow
   std::map<VMA*, u64> evictedSizePerVMA;
+
   for(Buffer* buf: toEvict){
     // Save eviction snap once; after EvictingToUncached the buffer is Uncached and
     // a concurrent prefetch may store a new snap before we reach the snap clear below.
     BufferSnapshot* eviction_snap = buf->snap.load(std::memory_order_relaxed);
     buf->updateSnapshot(eviction_snap);
+    // we must be careful here. if canBeEvicted touches the page, it will result in an invalid local TLB entry.
     if(buf->vma->canBeEvicted(buf)){
-      u64 phys = buf->EvictingToUncached(eviction_snap);
+      u64 phys = buf->EvictingToUncached(eviction_snap); // clears PTE
       if(phys != 0){
         // after this point the page has completely left the cache and any access will trigger
         // a whole new allocation
         VMA* vma = buf->vma;
-        frames_free_phys_addr(phys, vma->pageSize); // put back unused candidates
+
+        // put back unused candidates
+        if (vma->options.isolatedPhysicalPagePool) {
+          vma->localLLFree.value().frames_free_phys_addr(phys, vma->pageSize);
+        } else {
+          frames_free_phys_addr(phys, vma->pageSize);
+        }
+
         actuallyEvictedSize += vma->pageSize;
+        
         // A concurrent prefetch may have stored a new snap after EvictingToUncached.
         // Use CAS so we only null snap if it still holds the eviction snap, not a
         // newly stored prefetch snap.
         BufferSnapshot* expected = eviction_snap;
         buf->snap.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed, std::memory_order_relaxed);
         delete eviction_snap;
+
         if(evictedSizePerVMA.find(vma) == evictedSizePerVMA.end()){
           evictedSizePerVMA[vma] = vma->pageSize;
         }else{
@@ -959,10 +1085,12 @@ void uCache::evict(){
       assert_crash(buf->vma->residentSet->insert(buf)); // return the page to the RS
     }
   }
+
   for(const auto& p: evictedSizePerVMA){
     VMA* vma = p.first;
     vma->usedPhysSize -= p.second; 
   }
+
   usedPhysSize -= actuallyEvictedSize;
   if(debug){
     end = processor::rdtsc();
@@ -1021,6 +1149,20 @@ void uCache::flushBuffers(std::vector<Buffer*>& toWrite){
   writeSize += sizeWritten;
 }
 
+void uCache::flushBufferLocalTLBEntries(Buffer* buf) {
+  // todo: avoid allocating here if possible...
+  std::vector<void*> addressesToFlush;
+  addressesToFlush.reserve(buf->vma->nbPages);
+  for(u64 i = 0; i < buf->vma->nbPages; i++){
+    addressesToFlush.push_back(buf->baseVirt+i*mmu::page_size);
+  }
+
+  mmu::invlpg_tlb_local(addressesToFlush.data(), addressesToFlush.size());
+
+  // not really a tlb flush
+  // tlbFlush++;
+}
+
 void createCache(u64 physSize, int evict_batch, int prefetch_batch){
   ucache_frames_init(physSize);
   uCacheManager->init(physSize, evict_batch, prefetch_batch);
@@ -1033,6 +1175,7 @@ void createCache(u64 physSize, int evict_batch, int prefetch_batch){
   default_callbacks.post_EvictingToCached_callback_implem = empty_unconditional_callback;
   default_callbacks.post_ReadyToInsertToCached_callback_implem = empty_unconditional_callback;
   default_callbacks.misprediction_callback_implem = empty_unconditional_callback;
+  default_callbacks.post_io_pre_mapped_callback_implem = empty_unconditional_callback;
   default_callbacks.prefetch_pol = default_prefetch;
   default_callbacks.evict_pol = global_default_transparent_eviction;
 }

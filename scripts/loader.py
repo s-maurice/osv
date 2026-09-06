@@ -1330,9 +1330,11 @@ def all_traces():
             tp = tracepoints.get(tp_key, None)
             if not tp:
                 tp_ref = gdb.Value(tp_key).cast(tp_ptr)
-
-                tp = TracePoint(tp_key, str(tp_ref["name"].string()),
-                    sig_to_string(str(tp_ref["sig"].string())), str(tp_ref["format"].string()))
+                try:
+                    tp = TracePoint(tp_key, str(tp_ref["name"].string()),
+                        sig_to_string(str(tp_ref["sig"].string())), str(tp_ref["format"].string()))
+                except gdb.MemoryError:
+                    break
                 tracepoints[tp_key] = tp
 
             backtrace = None

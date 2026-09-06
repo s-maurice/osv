@@ -1,7 +1,9 @@
 #ifndef UCACHE_HH
 #define UCACHE_HH
 
+#include <optional>
 #include <osv/mmu.hh>
+#include "mmu-defs.hh"
 #include <atomic>
 #include <vector>
 #include <algorithm>
@@ -223,7 +225,7 @@ namespace ucache {
     asm volatile("invlpg (%0)" ::"r" (addr) : "memory");
   }
 
-  enum BufferState{
+  enum BufferState {
     Cached, // phys != 0 and present == 1
     Inserting,
     Reading, // currently being read
@@ -235,7 +237,7 @@ namespace ucache {
     TBD // just something to work with
   };
 
-  struct VMA;
+  class VMA;
 
   struct BufferSnapshot {
     PTE *ptes;
@@ -417,11 +419,53 @@ namespace ucache {
     unconditional_callback post_EvictingToCached_callback_implem;
     unconditional_callback post_ReadyToInsertToCached_callback_implem;
     unconditional_callback misprediction_callback_implem;
+    // Called after the page is loaded, but before it is mapped into the vma.
+    // buf->baseVirt points into the linear/physical page mapping. The buf object
+    // passed to this callback is not fully valid: the page is not yet mapped.
+    unconditional_callback post_io_pre_mapped_callback_implem;
 
     alloc_func prefetch_pol;
     evict_func evict_pol;
   };
   extern callbacks default_callbacks;
+
+  struct VMAOptions {
+    bool skipTLBShootdown = false; // if this flag is set, this VMA will not issue IPI TLB Invalidations when un-mapping pages.
+    bool isolatedPhysicalPagePool = false;
+    u64 isolatedPhysicalPagePoolSize = 0; // size in bytes. Is rounded up to the next power of 2.
+  };
+
+  // used if we have isolatedPhysicalPagePool option set
+  // we allocate upfront a bunch of physical pages from osv's llfree page allocator
+  // then, we set up our own local llfree allocator instance
+  class LocalLLFreeInstance {
+    // u64 pool_size;
+
+    // llfree max order is LLFREE_HUGE_ORDER=9 (512 pages = 2MB per chunk).
+    static constexpr size_t CHUNK_ORDER  = 9;
+    static constexpr size_t CHUNK_FRAMES = 1 << CHUNK_ORDER;
+    std::vector<phys_addr> chunk_bases;  // sorted for reverse lookup; chunk i → local frames [i*CHUNK_FRAMES, (i+1)*CHUNK_FRAMES)
+
+    llfree_meta_t meta;
+    llfree_t* local_llfree;
+
+    public:
+      LocalLLFreeInstance(VMAOptions* vma_options);
+      ~LocalLLFreeInstance();
+
+      LocalLLFreeInstance(LocalLLFreeInstance&& o) noexcept
+        : chunk_bases(std::move(o.chunk_bases))
+        , meta(o.meta)
+        , local_llfree(o.local_llfree)
+      {
+        o.meta = {};
+        o.local_llfree = nullptr;
+      }
+
+      // api mirrors the osv llfree api
+      phys_addr frames_alloc_phys_addr(size_t size);
+      void frames_free_phys_addr(phys_addr addr, size_t size);
+  };
 
   class VMA {
     public:
@@ -438,7 +482,12 @@ namespace ucache {
       ResidentSet* residentSet;
       callbacks callback_implems;
 
-      VMA(u64, u64, ResidentSet*, ufile*, callbacks);
+      VMAOptions options;
+
+      // llfree related for handling isolatedPhysicalPagePool
+      std::optional<LocalLLFreeInstance> localLLFree;
+
+      VMA(u64, u64, ResidentSet*, ufile*, callbacks, VMAOptions* options=NULL);
       ~VMA(){}
 
       bool isValidPtr(void* addr){
@@ -485,6 +534,12 @@ namespace ucache {
 
       void misprediction_callback(Buffer* buf){
         callback_implems.misprediction_callback_implem(buf);
+      }
+
+      void post_io_pre_mapped_callback(Buffer* buf){
+        Buffer tmp = *buf;
+        tmp.baseVirt = mmu::phys_cast<void*>(PTE(*buf->pteRefs).phys << 12);
+        callback_implems.post_io_pre_mapped_callback_implem(&tmp);
       }
 
       void choosePrefetchingCandidates(void* addr, PrefetchList pl){
@@ -631,7 +686,8 @@ namespace ucache {
       void init(u64 physSize, int evict_batch, int prefetch_batch);
       ~uCache();
 
-      VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size, ufile* f=NULL);
+      // VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size, ufile* f=NULL);
+      VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size, ufile* f=NULL, VMAOptions* options=NULL);
       VMA* getVMA(void* addr);
 
       // Functions
@@ -648,6 +704,8 @@ namespace ucache {
       void evict();
       void getVMACandidates(std::vector<VMACandidate*> *vmaCandidates);
 
+      /// used by applications to flush the tlb entries for a buffer. Used with skipTLBShootdown option
+      static void flushBufferLocalTLBEntries(Buffer* buf);
   };
 
   extern uCache* uCacheManager;
