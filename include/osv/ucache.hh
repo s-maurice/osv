@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <osv/mmu.hh>
+#include <osv/debug.hh>
 #include "mmu-defs.hh"
 #include <atomic>
 #include <vector>
@@ -334,14 +335,14 @@ namespace ucache {
   static const int16_t blockSize = 512;
   static const u64 maxIOs = 4096;
 
-  inline void crash_osv(){
-    printf("aborting\n");
-    osv::halt();
+  inline void crash_osv(const char* file = "?", int line = 0){
+    abort("aborting: assert_crash failed at %s:%d\n", file, line);
   }
 
-  inline void assert_crash(bool cond){
+  inline void assert_crash(bool cond, const char* file = __builtin_FILE(),
+                           int line = __builtin_LINE()){
     if(!cond)
-      crash_osv();
+      crash_osv(file, line);
   }
 
   // only allow 4KiB -> 64 KiB and 2MiB
@@ -379,6 +380,7 @@ namespace ucache {
   typedef void (*evict_func)(VMA*, u64, EvictList);
   typedef bool (*conditional_callback) (Buffer* buf);
   typedef void (*unconditional_callback) (Buffer* buf);
+  typedef void (*post_io_callback) (Buffer* buf, void* page);
   typedef void (*batch_evict_func)(Buffer* const* buffers, size_t count);
 
   class ResidentSet{
@@ -436,10 +438,10 @@ namespace ucache {
     unconditional_callback post_EvictingToCached_callback_implem;
     unconditional_callback post_ReadyToInsertToCached_callback_implem;
     unconditional_callback misprediction_callback_implem;
-    // Called after the page is loaded, but before it is mapped into the vma.
-    // buf->baseVirt points into the linear/physical page mapping. The buf object
-    // passed to this callback is not fully valid: the page is not yet mapped.
-    unconditional_callback post_io_pre_mapped_callback_implem;
+    // Called after the page is loaded, but before it is mapped into the vma. `page`
+    // points into the linear/physical page mapping. The buf object passed to this
+    // callback is not fully valid: the page is not yet mapped.
+    post_io_callback post_io_pre_mapped_callback_implem;
     // Called once per vma per eviction batch, after the PTEs are cleared and the TLB flushed.
     batch_evict_func post_EvictedBatch_callback_implem;
 
@@ -545,10 +547,8 @@ namespace ucache {
       }
 
       void post_io_pre_mapped_callback(Buffer* buf){
-        void* savedVirt = buf->baseVirt;
-        buf->baseVirt = mmu::phys_cast<void*>(PTE(*buf->pteRefs).phys << 12);
-        callback_implems.post_io_pre_mapped_callback_implem(buf);
-        buf->baseVirt = savedVirt;
+        callback_implems.post_io_pre_mapped_callback_implem(
+            buf, mmu::phys_cast<void*>(PTE(*buf->pteRefs).phys << 12));
       }
 
       void choosePrefetchingCandidates(void* addr, PrefetchList pl){
@@ -634,6 +634,10 @@ namespace ucache {
   }
 
   inline void empty_unconditional_callback(Buffer* buf){
+    return;
+  }
+
+  inline void empty_post_io_callback(Buffer* /*buf*/, void* /*page*/){
     return;
   }
 

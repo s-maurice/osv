@@ -766,6 +766,23 @@ namespace ucache {
   void uCache::handlePageFault(VMA* vma, void* faultingAddr, exception_frame *ef){
     pageFaults++;
     void* basePage = alignPage(faultingAddr, vma->pageSize);
+    // Report issues here, we can't throw an exception out of a fault handler.
+    u64 idx = ((uintptr_t)basePage - (uintptr_t)vma->start) / vma->pageSize;
+    if(!vma->isValidPtr(basePage) || idx >= vma->buffers.size()){
+      printf("[ucache] fault outside VMA: addr=%p base=%p idx=%lu\n",
+             faultingAddr, basePage, idx);
+      printf("[ucache]   chosen: id=%lu [%p, %p) pageSize=%lu buffers=%lu expected=%lu\n",
+             vma->id, vma->start, (void*)((uintptr_t)vma->start + vma->size),
+             vma->pageSize, (u64)vma->buffers.size(),
+             vma->pageSize ? vma->size / vma->pageSize : 0);
+      for(auto& p: vmas){
+        VMA* o = p.second;
+        printf("[ucache]   vma id=%lu [%p, %p) pageSize=%lu buffers=%lu%s\n",
+               o->id, o->start, (void*)((uintptr_t)o->start + o->size), o->pageSize,
+               (u64)o->buffers.size(), o->isValidPtr(basePage) ? "  <- contains addr" : "");
+      }
+      abort("[ucache] page fault outside the VMA it was resolved to\n");
+    }
     Buffer* buffer = vma->getBuffer(basePage);
     handleFault(vma, buffer);
   }
@@ -1327,7 +1344,7 @@ void createCache(u64 physSize, int evict_batch, int prefetch_batch){
   default_callbacks.post_EvictingToCached_callback_implem = empty_unconditional_callback;
   default_callbacks.post_ReadyToInsertToCached_callback_implem = empty_unconditional_callback;
   default_callbacks.misprediction_callback_implem = empty_unconditional_callback;
-  default_callbacks.post_io_pre_mapped_callback_implem = empty_unconditional_callback;
+  default_callbacks.post_io_pre_mapped_callback_implem = empty_post_io_callback;
   default_callbacks.post_EvictedBatch_callback_implem = empty_batch_evict_callback;
   default_callbacks.prefetch_pol = default_prefetch;
   default_callbacks.evict_pol = global_default_transparent_eviction;
