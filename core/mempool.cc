@@ -1805,6 +1805,17 @@ void frames_free_phys_addr(u64 idx, size_t size) {
         idx, memory::llfree_allocator.order(size));
 }
 
+// Allocate inner pte frames from global pool.
+u64 pt_frames_alloc_phys_addr(size_t size) {
+    return memory::llfree_allocator.alloc_page_phys_addr(
+        memory::llfree_allocator.order(size));
+}
+
+void pt_frames_free_phys_addr(u64 idx, size_t size) {
+    memory::llfree_allocator.free_page_phys_addr(
+        idx, memory::llfree_allocator.order(size));
+}
+
 u64 stat_free_phys_mem()  { return memory::llfree_allocator.free_memory(); }
 u64 stat_total_phys_mem() { return memory::total_memory.load(); }
 

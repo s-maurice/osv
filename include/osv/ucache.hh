@@ -84,6 +84,10 @@ namespace ucache {
   phys_addr frames_alloc_phys_addr(size_t size);
   void frames_free_phys_addr(u64 addr, size_t size);
 
+  /// Inner pte frames, always from the global llfree, never the private pool.
+  phys_addr pt_frames_alloc_phys_addr(size_t size);
+  void pt_frames_free_phys_addr(u64 addr, size_t size);
+
   /// [ THREADSAFE ]
   /// Free physically contiguous memory
   /// Requires the address returned by frames_alloc
@@ -169,7 +173,7 @@ namespace ucache {
   inline virt_addr ensure_valid_pt_elem(virt_addr parent, unsigned idx, bool with_frame, bool huge=false){
     if(pt_elem(parent[idx]).phys == 0 || pt_elem(parent[idx]).present == 0 || pt_elem(parent[idx]).writable == 0 || (parent[idx] & pt_elem::valid_mask()) != 0){ // if the children is an empty page
       u64 page_size = huge ? 2ul*1024*1024 : 4096;
-      u64 frame = with_frame ? frames_alloc_phys_addr(page_size) : 0ul;
+      u64 frame = with_frame ? pt_frames_alloc_phys_addr(page_size) : 0ul;
       pt_elem pte = pt_elem::make(frame, huge);
       parent[idx] = pte.word;
       if(with_frame) // initialize new page
@@ -244,6 +248,7 @@ namespace ucache {
     PTE *ptes;
     aio_req_t* reqs;
     BufferState state;
+    s64 ready_at_ns = 0; // simulated-remote deadline; 0 = simulation off
 
     BufferSnapshot(u64 nbPages){
       ptes = (PTE*)malloc(nbPages * sizeof(PTE));
@@ -409,6 +414,16 @@ namespace ucache {
       bool remove(Buffer* buf) override;
       u64 getNextBatch(u64 batch) override;
       Buffer* getEntry(int) override;
+  };
+
+  // For policies that do not rely on a resident set.
+  class NullResidentSet: public ResidentSet {
+    public:
+      NullResidentSet(){ mask = 0; }
+      bool insert(Buffer*) override { return true; }
+      bool remove(Buffer*) override { return true; }
+      u64 getNextBatch(u64) override { return 0; }
+      Buffer* getEntry(int) override { return nullptr; }
   };
 
   struct callbacks {

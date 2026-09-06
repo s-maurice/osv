@@ -652,6 +652,50 @@ namespace ucache {
     return NULL;
   }
 
+  // ── Simulated remote storage ────────────────────────────────────────────────
+  // Simulated bandwidth and latency for benchmarking, similar to the cache_httpfs
+  // benchmark. Off unless UCACHE_SIM_LATENCY_US / UCACHE_SIM_BW_GBPS is set.
+  static u64 sim_latency_us = 0;
+  static u64 sim_bw_bytes_per_sec = 0;
+
+  // Per-CPU with a cache-line stride: this sits on the fault path, so no shared atomic.
+  static constexpr u64 sim_stride = 8;
+  static u64* sim_stall_ns = nullptr;
+  static u64* sim_reqs = nullptr;
+
+  static inline bool sim_enabled(){ return sim_latency_us || sim_bw_bytes_per_sec; }
+
+  static inline u64 simCostNs(u64 bytes){
+    u64 ns = sim_latency_us * 1000;
+    if(sim_bw_bytes_per_sec) ns += bytes * 1000000000ull / sim_bw_bytes_per_sec;
+    return ns;
+  }
+
+  static inline s64 simNowNs(){
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             osv::clock::uptime::now().time_since_epoch()).count();
+  }
+
+  // TODO: spin like osv does for nvme access.
+  static void simStall(u64 ns){
+    sim_stall_ns[sched::cpu::current()->id * sim_stride] += ns;
+    sched::thread::sleep(std::chrono::nanoseconds(ns));
+  }
+
+  // One synchronous request: latency plus transfer.
+  static void simChargeSync(u64 bytes){
+    if(!sim_enabled()) return;
+    sim_reqs[sched::cpu::current()->id * sim_stride]++;
+    simStall(simCostNs(bytes));
+  }
+
+  // Wait out an async prefetch's simulated arrival; free if it ran far enough ahead.
+  static void simWaitUntil(s64 deadline_ns){
+    if(deadline_ns == 0) return;
+    s64 remaining = deadline_ns - simNowNs();
+    if(remaining > 0) simStall((u64)remaining);
+  }
+
   bool uCache::checkPipeline(Buffer* buffer, BufferSnapshot* bs){
     if(bs->state == BufferState::Inconsistent){
       do{
@@ -671,7 +715,11 @@ namespace ucache {
         } else {
           buffer->vma->file->poll_on_cpu(claimed->reqs, prefetcher_cpu);
         }
+        s64 ready_at = claimed->ready_at_ns;
         delete claimed;
+
+        simWaitUntil(ready_at);
+
         buffer->clearIO(false);      // io=1 → io=0: Reading → ReadyToInsert
         buffer->updateSnapshot(bs);  // refresh bs so fall-through completes the insert
       } else {
@@ -685,7 +733,11 @@ namespace ucache {
             } else {
               buffer->vma->file->poll_on_cpu(retry->reqs, pf_cpu);
             }
+            s64 ready_at = retry->ready_at_ns;
             delete retry;
+
+            simWaitUntil(ready_at);
+
             buffer->clearIO(false);
             buffer->updateSnapshot(bs);
             break;
@@ -738,6 +790,13 @@ namespace ucache {
     uCacheManager->prefetch_issued_bytes = 0;
     uCacheManager->pageFaults = 0;
     uCacheManager->mispredictions = 0;
+
+    if(sim_enabled()){
+      for(size_t i = 0; i < sched::cpus.size(); i++){
+        sim_stall_ns[i * sim_stride] = 0;
+        sim_reqs[i * sim_stride]     = 0;
+      }
+    }
   }
 
   void reset_stats(int i){
@@ -869,12 +928,30 @@ namespace ucache {
         u64 resolved = (u64)uCacheManager->prefetchedSize;
         printf("prefetch_inflight_bytes: %s\n", fmt_bytes(issued >= resolved ? issued - resolved : 0));
     }
+
+    if(sim_enabled()){
+        u64 stall = 0, reqs = 0;
+        for(size_t i = 0; i < sched::cpus.size(); i++){
+            stall += sim_stall_ns[i * sim_stride];
+            reqs  += sim_reqs[i * sim_stride];
+        }
+        printf("sim_requests:            %lu\n", reqs);
+        printf("sim_stall_total:         %.2f s (summed over CPUs)\n", stall / 1e9);
+    }
   }
 
   void uCache::prefetch(VMA *vma, PrefetchList pl){
     if(pl.size() == 0){ return;}
+
+    s64 ready_at = 0;
+    if(sim_enabled()){
+      sim_reqs[sched::cpu::current()->id * sim_stride]++;
+      ready_at = simNowNs() + (s64)simCostNs(pl.size() * vma->pageSize);
+    }
+
     for(Buffer* buf: pl){
       BufferSnapshot* bs = new BufferSnapshot(vma->nbPages);
+      bs->ready_at_ns = ready_at;
       buf->updateSnapshot(bs);
 
       u64 phys;
@@ -1170,6 +1247,9 @@ void uCache::readBuffer(Buffer* buf){
   // read into the kernel identity mapping.
   PTE pte(buf->pteRefs[0].load());
   char* kern_virt = mmu::phys_cast<char>(pte.phys << 12);
+
+  simChargeSync(buf->vma->pageSize);
+
   buf->vma->file->read(kern_virt, (u64)buf->baseVirt-(u64)buf->vma->start, buf->vma->pageSize);
   readSize += buf->vma->pageSize;
 }
@@ -1224,6 +1304,20 @@ void uCache::flushBufferLocalTLBEntries(Buffer* buf) {
 void createCache(u64 physSize, int evict_batch, int prefetch_batch){
   ucache_frames_init(physSize);
   uCacheManager->init(physSize, evict_batch, prefetch_batch);
+
+  // Benchmark-only knobs, read here rather than plumbed through the uCache API.
+  if(const char* s = getenv("UCACHE_SIM_LATENCY_US")) sim_latency_us = strtoull(s, NULL, 10);
+  if(const char* s = getenv("UCACHE_SIM_BW_GBPS")){
+    double gbps = strtod(s, NULL);
+    if(gbps > 0.0) sim_bw_bytes_per_sec = (u64)(gbps * 1e9);
+  }
+  if(sim_enabled()){
+    sim_stall_ns = (u64*)calloc(sched::cpus.size() * sim_stride, sizeof(u64));
+    sim_reqs     = (u64*)calloc(sched::cpus.size() * sim_stride, sizeof(u64));
+    printf("[ucache] remote simulation: latency=%luus bandwidth=%.2f GB/s\n",
+           sim_latency_us, sim_bw_bytes_per_sec / 1e9);
+  }
+
   default_callbacks.isDirty_implem = pte_isDirty;
   default_callbacks.clearDirty_implem = pte_clearDirty;
   default_callbacks.setDirty_implem = empty_unconditional_callback;

@@ -33,7 +33,7 @@ run:
 # mem    — total physical memory given to the QEMU VM (default 8G)
 # cache  — bytes for OSv uCache; K/M/G suffix accepted (default: 50% of mem)
 # duckdb — DuckDB buffer pool limit; K/M/G suffix accepted (default: 80% of cache)
-run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="":
+run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -61,6 +61,14 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
     fi
     if [ -n "{{print}}" ]; then
         osv_env="${osv_env} --env=TPCH_PRINT=1"
+    fi
+
+    # Simulated object-store cost, matching cache_httpfs's knobs. Unset = off.
+    if [ -n "{{sim_latency_us}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_SIM_LATENCY_US={{sim_latency_us}}"
+    fi
+    if [ -n "{{sim_bw_gbps}}" ]; then
+        osv_env="${osv_env} --env=UCACHE_SIM_BW_GBPS={{sim_bw_gbps}}"
     fi
 
     # -k: PVH kernel mode — QEMU loads loader-stripped.elf directly, bypassing
@@ -145,9 +153,11 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
 # kernel's own CXXFLAGS, with the DuckDB include path appended via EXTRA_CXXFLAGS.
 #
 # Usage:
-#   just build-duckdb            # release build with LTO
-#   just build-duckdb lto=0      # disable LTO (faster rebuild for debugging)
-#   just build-duckdb fp=1       # keep frame pointers (profilable DuckDB frames)
+#   just build-duckdb              # release build with LTO
+#   just build-duckdb release 0    # disable LTO (faster rebuild for debugging)
+#   just build-duckdb release 1 1  # keep frame pointers (profilable DuckDB frames)
+#
+# Parameters are positional (mode lto fp) - `lto=0` is read as mode, not as lto.
 #
 build-duckdb mode="release" lto="1" fp="0":
     #!/usr/bin/env bash
