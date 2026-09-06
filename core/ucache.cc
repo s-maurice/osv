@@ -498,6 +498,7 @@ namespace ucache {
     callback_implems.post_ReadyToInsertToCached_callback_implem = implems.post_ReadyToInsertToCached_callback_implem;
     callback_implems.misprediction_callback_implem = implems.misprediction_callback_implem;
     callback_implems.post_io_pre_mapped_callback_implem = implems.post_io_pre_mapped_callback_implem;
+    callback_implems.post_EvictedBatch_callback_implem = implems.post_EvictedBatch_callback_implem;
     callback_implems.prefetch_pol = implems.prefetch_pol;
     callback_implems.evict_pol = implems.evict_pol;
   }
@@ -530,11 +531,9 @@ namespace ucache {
 
   uCache::~uCache(){};
 
-  LocalLLFreeInstance::LocalLLFreeInstance(VMAOptions* vma_options) {
-    assert_crash(vma_options->isolatedPhysicalPagePool);
-
+  FramePoolAllocator::FramePoolAllocator(u64 sizeBytes) {
     // round up to next power of 2. Size of the page pool.
-    auto order = memory::llf::order(vma_options->isolatedPhysicalPagePoolSize);
+    auto order = memory::llf::order(sizeBytes);
     u64 num_frames = (u64)1 << order;
 
     auto cores = sched::cpus.size();
@@ -559,7 +558,7 @@ namespace ucache {
     assert_crash(llfree_is_ok(ret));
   }
 
-  LocalLLFreeInstance::~LocalLLFreeInstance() {
+  FramePoolAllocator::~FramePoolAllocator() {
     for (phys_addr base : chunk_bases)
       ucache::frames_free_phys_addr(base, CHUNK_FRAMES * mmu::page_size);
     free(meta.local);
@@ -568,7 +567,7 @@ namespace ucache {
     free(local_llfree);
   }
 
-  phys_addr LocalLLFreeInstance::frames_alloc_phys_addr(size_t size) {
+  phys_addr FramePoolAllocator::frames_alloc_phys_addr(size_t size) {
     size_t core = sched::cpu::current() ? sched::cpu::current()->id : 0;
     llfree_result_t result = llfree_get(local_llfree, core, llflags(0));
     if (llfree_is_ok(result)) {
@@ -580,7 +579,7 @@ namespace ucache {
     return 0;
   }
 
-  void LocalLLFreeInstance::frames_free_phys_addr(phys_addr addr, size_t size) {
+  void FramePoolAllocator::frames_free_phys_addr(phys_addr addr, size_t size) {
     // order-9 allocations are naturally 512-page aligned, so masking recovers the chunk base
     phys_addr chunk_base = addr & ~(phys_addr)(CHUNK_FRAMES - 1);
     // chunk_bases is sorted, so lower_bound finds the owning chunk in O(log n)
@@ -607,6 +606,8 @@ namespace ucache {
     }
     assert_crash(f != NULL);
     vma = new VMA(align_up(f->size, pageSize), pageSize, uCacheManager->globalResidentSet, f, default_callbacks, options);
+    // new vmas have the default policy
+    nb_default_policy_vmas.fetch_add(1, std::memory_order_relaxed);
     for(u64 i = 0; i < vma->size / vma->pageSize; i++){
       vma->buffers.push_back(new Buffer(vma->start+(i*vma->pageSize), vma->pageSize, vma));
     }
@@ -616,12 +617,22 @@ namespace ucache {
       cout << "Added a vm_area @ " << vma->start << " of size: " << vma->file->size << ", with pageSize: " << vma->pageSize << ", for file: " << name << endl;
     }
 
-    if (vma->options.isolatedPhysicalPagePool) {
-      vma->localLLFree.emplace(&vma->options);
+    if (options && options->framePool) {
+      vma->framePool = options->framePool;
     }
   
     this->fs->devices[0]->switch_to_poll_mode();
     return vma;
+  }
+
+  void uCache::setEvictionPolicy(VMA* vma, evict_func newpol){
+    bool wasDefault = (vma->callback_implems.evict_pol == global_default_transparent_eviction);
+    bool nowDefault = (newpol == global_default_transparent_eviction);
+    if(wasDefault && !nowDefault)
+      nb_default_policy_vmas.fetch_sub(1, std::memory_order_relaxed);
+    else if(!wasDefault && nowDefault)
+      nb_default_policy_vmas.fetch_add(1, std::memory_order_relaxed);
+    vma->callback_implems.evict_pol = newpol;
   }
 
   VMA* uCache::getVMA(void* addr){
@@ -715,6 +726,15 @@ namespace ucache {
   u64 *percore_read = (u64*)calloc(sched::cpus.size(), sizeof(u64));
   u64 *percore_end = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 
+  void reset_io_stats(){
+    uCacheManager->readSize = 0;
+    uCacheManager->writeSize = 0;
+    uCacheManager->prefetchedSize = 0;
+    uCacheManager->prefetch_issued_bytes = 0;
+    uCacheManager->pageFaults = 0;
+    uCacheManager->mispredictions = 0;
+  }
+
   void reset_stats(int i){
     percore_count[i] = 0;
     percore_evict_count[i] = 0;
@@ -758,8 +778,8 @@ namespace ucache {
     }
 
     // alloc
-    if (vma->options.isolatedPhysicalPagePool) {
-      phys = vma->localLLFree.value().frames_alloc_phys_addr(vma->pageSize);
+    if (vma->framePool) {
+      phys = vma->framePool->frames_alloc_phys_addr(vma->pageSize);
     } else {
       phys = frames_alloc_phys_addr(vma->pageSize);
     }
@@ -794,8 +814,8 @@ namespace ucache {
         percore_count[sched::cpu::current()->id]++;
       }
     }else{
-      if (vma->options.isolatedPhysicalPagePool) {
-        vma->localLLFree.value().frames_free_phys_addr(phys, vma->pageSize);
+      if (vma->framePool) {
+        vma->framePool->frames_free_phys_addr(phys, vma->pageSize);
       } else {
         frames_free_phys_addr(phys, vma->pageSize);
       }
@@ -854,8 +874,8 @@ namespace ucache {
 
       u64 phys;
      // alloc
-      if (vma->options.isolatedPhysicalPagePool) {
-        phys = vma->localLLFree.value().frames_alloc_phys_addr(vma->pageSize);
+      if (vma->framePool) {
+        phys = vma->framePool->frames_alloc_phys_addr(vma->pageSize);
       } else {
         phys = frames_alloc_phys_addr(vma->pageSize);
       }
@@ -871,8 +891,8 @@ namespace ucache {
         assert_crash(vma->residentSet->insert(buf));
       }else{
         // put back unused candidates
-        if (vma->options.isolatedPhysicalPagePool) {
-          vma->localLLFree.value().frames_free_phys_addr(phys, vma->pageSize);
+        if (vma->framePool) {
+          vma->framePool->frames_free_phys_addr(phys, vma->pageSize);
         } else {
           frames_free_phys_addr(phys, vma->pageSize);
         }
@@ -963,8 +983,6 @@ void uCache::evict(){
 
   if(debug)
     start = processor::rdtsc();
-  // 0. find candidates from the global LRU queue (all VMAs using default policy)
-  global_default_transparent_eviction(nullptr, evict_batch, toEvict);
   // Also evict from VMAs with a custom eviction policy (those have their own
   // per-VMA ResidentSet, not the globalResidentSet, so they are invisible to
   // global_default_transparent_eviction).
@@ -975,6 +993,11 @@ void uCache::evict(){
       u64 still = evict_batch - toEvict.size();
       vma->chooseEvictionCandidates(still, toEvict);
     }
+  }
+  // 0. find candidates from the global LRU queue (all VMAs using default policy)
+  if(nb_default_policy_vmas.load(std::memory_order_relaxed) > 0 &&
+     (u64)toEvict.size() < evict_batch){
+    global_default_transparent_eviction(nullptr, evict_batch, toEvict);
   }
   if(debug)
     m1 = processor::rdtsc();
@@ -1033,8 +1056,13 @@ void uCache::evict(){
 
   u64 actuallyEvictedSize = 0;
 
-  // this map is likely quite slow
-  std::map<VMA*, u64> evictedSizePerVMA;
+  // Sort by virtual address. This groups different vmas and orders adjacent frames.
+  std::sort(toEvict.begin(), toEvict.end(), [](Buffer* a, Buffer* b){
+    return a->baseVirt < b->baseVirt;
+  });
+
+  std::vector<Buffer*> evicted;
+  evicted.reserve(toEvict.size());
 
   for(Buffer* buf: toEvict){
     // Save eviction snap once; after EvictingToUncached the buffer is Uncached and
@@ -1050,14 +1078,14 @@ void uCache::evict(){
         VMA* vma = buf->vma;
 
         // put back unused candidates
-        if (vma->options.isolatedPhysicalPagePool) {
-          vma->localLLFree.value().frames_free_phys_addr(phys, vma->pageSize);
+        if (vma->framePool) {
+          vma->framePool->frames_free_phys_addr(phys, vma->pageSize);
         } else {
           frames_free_phys_addr(phys, vma->pageSize);
         }
 
         actuallyEvictedSize += vma->pageSize;
-        
+
         // A concurrent prefetch may have stored a new snap after EvictingToUncached.
         // Use CAS so we only null snap if it still holds the eviction snap, not a
         // newly stored prefetch snap.
@@ -1065,11 +1093,7 @@ void uCache::evict(){
         buf->snap.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed, std::memory_order_relaxed);
         delete eviction_snap;
 
-        if(evictedSizePerVMA.find(vma) == evictedSizePerVMA.end()){
-          evictedSizePerVMA[vma] = vma->pageSize;
-        }else{
-          evictedSizePerVMA[vma] += vma->pageSize;
-        }
+        evicted.push_back(buf);
       }else{
         BufferSnapshot* expected = eviction_snap;
         buf->snap.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed, std::memory_order_relaxed);
@@ -1086,9 +1110,18 @@ void uCache::evict(){
     }
   }
 
-  for(const auto& p: evictedSizePerVMA){
-    VMA* vma = p.first;
-    vma->usedPhysSize -= p.second; 
+  // call the batch callback and updated usedPhysSize for every evicted VMA
+  {
+    Buffer* const* base = evicted.data();
+    size_t i = 0;
+    while (i < evicted.size()) {
+      VMA* vma = evicted[i]->vma;
+      size_t j = i + 1;
+      while (j < evicted.size() && evicted[j]->vma == vma) ++j;
+      vma->usedPhysSize -= (j - i) * vma->pageSize;
+      vma->callback_implems.post_EvictedBatch_callback_implem(base + i, j - i);
+      i = j;
+    }
   }
 
   usedPhysSize -= actuallyEvictedSize;
@@ -1176,6 +1209,7 @@ void createCache(u64 physSize, int evict_batch, int prefetch_batch){
   default_callbacks.post_ReadyToInsertToCached_callback_implem = empty_unconditional_callback;
   default_callbacks.misprediction_callback_implem = empty_unconditional_callback;
   default_callbacks.post_io_pre_mapped_callback_implem = empty_unconditional_callback;
+  default_callbacks.post_EvictedBatch_callback_implem = empty_batch_evict_callback;
   default_callbacks.prefetch_pol = default_prefetch;
   default_callbacks.evict_pol = global_default_transparent_eviction;
 }

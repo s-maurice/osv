@@ -34,6 +34,7 @@ namespace ucache {
 
   const bool debug = false;
   void reset_stats(int i);
+  void reset_io_stats();
   const bool batch_io_request = true;
   void print_stats();
 
@@ -373,6 +374,7 @@ namespace ucache {
   typedef void (*evict_func)(VMA*, u64, EvictList);
   typedef bool (*conditional_callback) (Buffer* buf);
   typedef void (*unconditional_callback) (Buffer* buf);
+  typedef void (*batch_evict_func)(Buffer* const* buffers, size_t count);
 
   class ResidentSet{
     public:
@@ -423,6 +425,8 @@ namespace ucache {
     // buf->baseVirt points into the linear/physical page mapping. The buf object
     // passed to this callback is not fully valid: the page is not yet mapped.
     unconditional_callback post_io_pre_mapped_callback_implem;
+    // Called once per vma per eviction batch, after the PTEs are cleared and the TLB flushed.
+    batch_evict_func post_EvictedBatch_callback_implem;
 
     alloc_func prefetch_pol;
     evict_func evict_pol;
@@ -431,16 +435,15 @@ namespace ucache {
 
   struct VMAOptions {
     bool skipTLBShootdown = false; // if this flag is set, this VMA will not issue IPI TLB Invalidations when un-mapping pages.
-    bool isolatedPhysicalPagePool = false;
-    u64 isolatedPhysicalPagePoolSize = 0; // size in bytes. Is rounded up to the next power of 2.
+    std::shared_ptr<class FramePoolAllocator> framePool; // optional isolated frame pool; if null, the global llfree allocator is used
+    void* user_data = nullptr; // opaque per-VMA context; accessible inside callbacks via buf->vma->options.user_data
   };
 
-  // used if we have isolatedPhysicalPagePool option set
-  // we allocate upfront a bunch of physical pages from osv's llfree page allocator
-  // then, we set up our own local llfree allocator instance
-  class LocalLLFreeInstance {
-    // u64 pool_size;
-
+  // Upfront-allocated pool of physical frames backed by a private llfree instance.
+  // sizeBytes is rounded up to the next power of 2.
+  // Create with make_shared<FramePoolAllocator>(sizeBytes) and pass via VMAOptions::framePool.
+  // Can be shared across multiple VMAs.
+  class FramePoolAllocator {
     // llfree max order is LLFREE_HUGE_ORDER=9 (512 pages = 2MB per chunk).
     static constexpr size_t CHUNK_ORDER  = 9;
     static constexpr size_t CHUNK_FRAMES = 1 << CHUNK_ORDER;
@@ -450,17 +453,8 @@ namespace ucache {
     llfree_t* local_llfree;
 
     public:
-      LocalLLFreeInstance(VMAOptions* vma_options);
-      ~LocalLLFreeInstance();
-
-      LocalLLFreeInstance(LocalLLFreeInstance&& o) noexcept
-        : chunk_bases(std::move(o.chunk_bases))
-        , meta(o.meta)
-        , local_llfree(o.local_llfree)
-      {
-        o.meta = {};
-        o.local_llfree = nullptr;
-      }
+      explicit FramePoolAllocator(u64 sizeBytes);
+      ~FramePoolAllocator();
 
       // api mirrors the osv llfree api
       phys_addr frames_alloc_phys_addr(size_t size);
@@ -484,8 +478,7 @@ namespace ucache {
 
       VMAOptions options;
 
-      // llfree related for handling isolatedPhysicalPagePool
-      std::optional<LocalLLFreeInstance> localLLFree;
+      std::shared_ptr<FramePoolAllocator> framePool;
 
       VMA(u64, u64, ResidentSet*, ufile*, callbacks, VMAOptions* options=NULL);
       ~VMA(){}
@@ -629,6 +622,10 @@ namespace ucache {
     return;
   }
 
+  inline void empty_batch_evict_callback(Buffer* const* /*buffers*/, size_t /*count*/){
+    return;
+  }
+
   inline bool empty_conditional_callback(Buffer* buf){
     return true;
   }
@@ -683,6 +680,9 @@ namespace ucache {
       std::atomic<u64> poll_depth;
       std::atomic<u64> poll_depth_count;
 
+      // number of VMAs currently using the default (global) eviction policy
+      std::atomic<u64> nb_default_policy_vmas{0};
+
       uCache();
       void init(u64 physSize, int evict_batch, int prefetch_batch);
       ~uCache();
@@ -690,6 +690,9 @@ namespace ucache {
       // VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size, ufile* f=NULL);
       VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size, ufile* f=NULL, VMAOptions* options=NULL);
       VMA* getVMA(void* addr);
+
+      // setter for evict_pol, updates nb_default_policy_vmas
+      void setEvictionPolicy(VMA* vma, evict_func newpol);
 
       // Functions
       void ensureFreePages(u64 additionalSize);

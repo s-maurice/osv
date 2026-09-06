@@ -626,8 +626,13 @@ void* do_main_thread(void *_main_args)
     }
     
     if(opt_nvme_ext){
-        mount_rootfs("/nvme", "/dev/nvme0", "ext", 0, nullptr, false);
-        //load_ext_library_and_mount_additional_ext();
+        load_fs_library("/usr/lib/fs/libext.so", []() {
+            auto error = mount_rootfs("/nvme", "/dev/nvme0", "ext", 0, nullptr, false);
+            if (error) {
+                debug("Could not mount ext filesystem on nvme.\n");
+            }
+            return error;
+        });
     }
 
 #if CONF_networking_stack
