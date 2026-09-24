@@ -329,6 +329,8 @@ namespace ucache {
 
     bool setIO();
     bool clearIO(bool dirty=false);
+
+    bool tryCompleteUnaccessedPrefetch(BufferSnapshot* bs);
   };
 
   static const int16_t maxQueueSize = 960;
@@ -563,6 +565,19 @@ namespace ucache {
         if(bs->ptes[0].io == 1){
           return false;
         }
+        return tryAcceptEvictionCandidate(buf, bs, el);
+      }
+
+      // Like addEvictionCandidate, but also accepts a never-accessed prefetch whose I/O is done.
+      bool addEvictionCandidateAllowUnaccessed(Buffer* buf, BufferSnapshot* bs, EvictList el){
+        if(bs->ptes[0].io == 1 && !buf->tryCompleteUnaccessedPrefetch(bs)){
+          return false;
+        }
+        return tryAcceptEvictionCandidate(buf, bs, el);
+      }
+
+    private:
+      bool tryAcceptEvictionCandidate(Buffer* buf, BufferSnapshot* bs, EvictList el){
         if(residentSet->remove(buf)){
           if(buf->CachedToEvicting(bs)){
             if(bs->ptes[0].present == 0 && buf->snap.load(std::memory_order_relaxed) != nullptr){ // misprediction where the IO bit was cleared when polling for another request

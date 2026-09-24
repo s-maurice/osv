@@ -696,6 +696,53 @@ namespace ucache {
     if(remaining > 0) simStall((u64)remaining);
   }
 
+  // Similar to checkPipeline(), but checks whether the prefetch I/O is complete without
+  // waiting on it, and if so moves the buffer from Reading to ReadyToInsert (bs refreshed).
+  // Returns true if bs is now ReadyToInsert; false if the I/O or simulated latency is still
+  // pending, or a fault/another evictor is completing it (nothing is changed then).
+  bool Buffer::tryCompleteUnaccessedPrefetch(BufferSnapshot* bs){
+    BufferSnapshot* claimed = snap.exchange(nullptr, std::memory_order_acq_rel);
+    if(claimed == nullptr){
+      return false; // a fault or another evictor is handling the completion
+    }
+
+    // respect simulated latency/bandwidth
+    if(claimed->ready_at_ns != 0 && simNowNs() < claimed->ready_at_ns){
+      snap.store(claimed, std::memory_order_release);
+      return false;
+    }
+
+    // peek (non-blocking) on the prefetch's I/O to see if we are ready
+    aio_req_t* reqs = claimed->reqs;
+    for(size_t i = 0; i < reqs->size; i++){
+      if((reqs->bios[i]->bio_flags & (BIO_DONE | BIO_ERROR)) == 0){
+        snap.store(claimed, std::memory_order_release);
+        return false;
+      }
+    }
+
+    // here, bios are complete, so this is non-blocking. Note: polls another CPU's NVMe queue.
+    int prefetcher_cpu = getPrefetcher() - 1;
+    vma->file->poll_on_cpu(reqs, prefetcher_cpu);
+
+    // cleanup, as there is no later poll()
+    for(size_t i = 0; i < reqs->size; i++){
+      destroy_bio(reqs->bios[i]);
+    }
+    delete reqs;
+    delete claimed;
+
+    // Reading -> ReadyToInsert
+    clearIO(false);
+    updateSnapshot(bs);
+    assert_crash(bs->state == BufferState::ReadyToInsert);
+
+    if(prefetcher_cpu >= 0){
+      uCacheManager->per_cpu_inflight_count[prefetcher_cpu].fetch_sub(1, std::memory_order_relaxed);
+    }
+    return true;
+  }
+
   bool uCache::checkPipeline(Buffer* buffer, BufferSnapshot* bs){
     if(bs->state == BufferState::Inconsistent){
       do{
