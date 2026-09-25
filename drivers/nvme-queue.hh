@@ -150,6 +150,7 @@ public:
     void try_poll_once();
 private:
     void poll_cq_locked();
+    void process_cqe_locked(nvme_cq_entry_t* cqep);
     void init_pending_bios(u32 level);
 
     inline u16 cid_to_row(u16 cid) { return cid / _qsize; }

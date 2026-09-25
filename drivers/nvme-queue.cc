@@ -401,7 +401,7 @@ int io_queue_pair::make_async_request(struct bio* bio, u32 nsid = 1)
     return 0;
 }
 
-// Must be called with _lock held.
+// Must be called with _lock held. Waits for one CQE and processes it.
 void io_queue_pair::poll_cq_locked()
 {
     nvme_cq_entry_t* cqep = nullptr;
@@ -409,6 +409,12 @@ void io_queue_pair::poll_cq_locked()
         cqep = get_completion_queue_entry();
         _mm_pause();
     }
+    process_cqe_locked(cqep);
+}
+
+// Must be called with _lock held.
+void io_queue_pair::process_cqe_locked(nvme_cq_entry_t* cqep)
+{
     // Read full CQ entry onto stack so we can advance CQ head ASAP
     // and release the CQ slot
     nvme_cq_entry_t cqe = *cqep;
@@ -503,7 +509,10 @@ void io_queue_pair::try_poll_once()
     if (!_lock.try_lock()) {
         return;
     }
-    poll_cq_locked();
+    nvme_cq_entry_t* cqep;
+    while ((cqep = get_completion_queue_entry())) {
+        process_cqe_locked(cqep);
+    }
     _lock.unlock();
 }
 
