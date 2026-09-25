@@ -665,6 +665,9 @@ namespace ucache {
 
   static inline bool sim_enabled(){ return sim_latency_us || sim_bw_bytes_per_sec; }
 
+  // Per-request simulated cost in ns.
+  // We do not simulate shared bandwidth, so the bandwidth limit applies to each request.
+  // (matches cache_httpfs, benchmarks/cachefs_compare.just)
   static inline u64 simCostNs(u64 bytes){
     u64 ns = sim_latency_us * 1000;
     if(sim_bw_bytes_per_sec) ns += bytes * 1000000000ull / sim_bw_bytes_per_sec;
