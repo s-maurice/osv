@@ -71,6 +71,8 @@ namespace ucache {
       virtual aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring) = 0;
       virtual void poll(aio_req_t* reqs) = 0;
       virtual void poll_on_cpu(aio_req_t* reqs, int cpu_id) = 0;
+      // Drain cpu_id's completion queue once without waiting (see io_queue_pair::try_poll_once).
+      virtual void try_poll_on_cpu(int cpu_id) = 0;
       virtual void close() = 0;
   };
 
@@ -88,6 +90,7 @@ namespace ucache {
       aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring);
       void poll(aio_req_t* reqs);
       void poll_on_cpu(aio_req_t* reqs, int cpu_id);
+      void try_poll_on_cpu(int cpu_id);
       void close();
       //void commit_io();//std::vector<int> &devices); 
 

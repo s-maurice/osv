@@ -510,6 +510,11 @@ void driver::poll_req_on_queue(struct bio* bio, int cpu_id){
     _io_queues[qidx]->drain_until(bio);
 }
 
+void driver::try_poll_queue(int cpu_id){
+    unsigned int qidx = (unsigned)cpu_id % _io_queues.size();
+    _io_queues[qidx]->try_poll_once();
+}
+
 void driver::register_admin_interrupt()
 {
     sched::thread* aq_thread = sched::thread::make([this] { this->_admin_queue->req_done(); },

@@ -738,17 +738,27 @@ namespace ucache {
       return false;
     }
 
-    // peek (non-blocking) on the prefetch's I/O to see if we are ready
+    // peek (non-blocking) on the prefetch's I/O to see if we are ready.
+    // prefetching CPUs may never poll on a buffer that is never faulted.
+    int prefetcher_cpu = getPrefetcher() - 1;
     aio_req_t* reqs = claimed->reqs;
+    bool polled = false;
     for(size_t i = 0; i < reqs->size; i++){
-      if((reqs->bios[i]->bio_flags & (BIO_DONE | BIO_ERROR)) == 0){
-        snap.store(claimed, std::memory_order_release);
-        return false;
+      if((reqs->bios[i]->bio_flags & (BIO_DONE | BIO_ERROR)) != 0){
+        continue;
       }
+      if(!polled && prefetcher_cpu >= 0){
+        vma->file->try_poll_on_cpu(prefetcher_cpu);
+        polled = true;
+        if((reqs->bios[i]->bio_flags & (BIO_DONE | BIO_ERROR)) != 0){
+          continue;
+        }
+      }
+      snap.store(claimed, std::memory_order_release);
+      return false;
     }
 
     // here, bios are complete, so this is non-blocking. Note: polls another CPU's NVMe queue.
-    int prefetcher_cpu = getPrefetcher() - 1;
     vma->file->poll_on_cpu(reqs, prefetcher_cpu);
 
     // cleanup, as there is no later poll()

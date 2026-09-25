@@ -147,6 +147,7 @@ public:
     int make_async_request(struct bio* bio, u32 nsid);
     void poll_cq();
     void drain_until(struct bio* bio);
+    void try_poll_once();
 private:
     void poll_cq_locked();
     void init_pending_bios(u32 level);

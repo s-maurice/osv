@@ -495,6 +495,18 @@ void io_queue_pair::drain_until(struct bio* bio)
     }
 }
 
+// Drain the currently available CQEs, without waiting.
+// If another CPU holds the lock, they are responsible for draining the queue, so we can instantly return.
+// Used to collect CQEs that do not have a waiter.
+void io_queue_pair::try_poll_once()
+{
+    if (!_lock.try_lock()) {
+        return;
+    }
+    poll_cq_locked();
+    _lock.unlock();
+}
+
 void io_queue_pair::req_done()
 {
     nvme_cq_entry_t* cqep = nullptr;

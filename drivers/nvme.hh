@@ -59,6 +59,7 @@ public:
     int make_async_request(struct bio* bio, u32 nsid = 1);
     void poll_req(struct bio* bio, u32 nsid = 1);
     void poll_req_on_queue(struct bio* bio, int cpu_id);
+    void try_poll_queue(int cpu_id);
     bool poll_mode;
 
     static hw_driver* probe(hw_device* dev);

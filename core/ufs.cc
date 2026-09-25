@@ -181,6 +181,10 @@ namespace ucache {
     }
   }
 
+  void local_ufile::try_poll_on_cpu(int cpu_id){
+    fs->devices[0]->try_poll_queue(cpu_id);
+  }
+
   /*void local_ufile::commit_io(){ //std::vector<int> &devs){
     unvme_ring_sq_doorbell(fs->devices[0], sched::cpu::current()->id);
     }*/
