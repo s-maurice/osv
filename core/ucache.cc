@@ -696,6 +696,32 @@ namespace ucache {
     if(remaining > 0) simStall((u64)remaining);
   }
 
+  // Free a drained prefetch's request. poll() destroys the bios, poll_on_cpu() does not.
+  static void freeReqs(aio_req_t* reqs, bool destroy_bios){
+    if(destroy_bios){
+      for(size_t i = 0; i < reqs->size; i++){
+        destroy_bio(reqs->bios[i]);
+      }
+    }
+    delete reqs;
+  }
+
+  // Wait for a claimed prefetch's I/O on the prefetcher's queue, then free the request and snapshot.
+  // Returns the snapshot's simulated-arrival deadline.
+  static s64 drainClaimedPrefetch(Buffer* buffer, BufferSnapshot* claimed){
+    int prefetcher_cpu = buffer->getPrefetcher() - 1;
+    bool same_cpu = prefetcher_cpu == (int)sched::cpu::current()->id;
+    if(same_cpu){
+      buffer->vma->file->poll(claimed->reqs);
+    } else {
+      buffer->vma->file->poll_on_cpu(claimed->reqs, prefetcher_cpu);
+    }
+    freeReqs(claimed->reqs, !same_cpu);
+    s64 ready_at = claimed->ready_at_ns;
+    delete claimed;
+    return ready_at;
+  }
+
   // Similar to checkPipeline(), but checks whether the prefetch I/O is complete without
   // waiting on it, and if so moves the buffer from Reading to ReadyToInsert (bs refreshed).
   // Returns true if bs is now ReadyToInsert; false if the I/O or simulated latency is still
@@ -726,10 +752,7 @@ namespace ucache {
     vma->file->poll_on_cpu(reqs, prefetcher_cpu);
 
     // cleanup, as there is no later poll()
-    for(size_t i = 0; i < reqs->size; i++){
-      destroy_bio(reqs->bios[i]);
-    }
-    delete reqs;
+    freeReqs(reqs, true);
     delete claimed;
 
     // Reading -> ReadyToInsert
@@ -752,18 +775,11 @@ namespace ucache {
         return true;
     }
     if(bs->state == BufferState::Reading){
-      int prefetcher_cpu = buffer->getPrefetcher() - 1;
       // Race to claim the aio_req_t: only one CPU gets the non-null value and
       // is responsible for draining the queue and performing the state transition.
       BufferSnapshot* claimed = buffer->snap.exchange(nullptr, std::memory_order_acq_rel);
       if(claimed != nullptr){
-        if(prefetcher_cpu == (int)sched::cpu::current()->id){
-          buffer->vma->file->poll(claimed->reqs);
-        } else {
-          buffer->vma->file->poll_on_cpu(claimed->reqs, prefetcher_cpu);
-        }
-        s64 ready_at = claimed->ready_at_ns;
-        delete claimed;
+        s64 ready_at = drainClaimedPrefetch(buffer, claimed);
 
         simWaitUntil(ready_at);
 
@@ -774,14 +790,7 @@ namespace ucache {
           _mm_pause();
           BufferSnapshot* retry = buffer->snap.exchange(nullptr, std::memory_order_acq_rel);
           if (retry != nullptr) {
-            int pf_cpu = buffer->getPrefetcher() - 1;
-            if(pf_cpu == (int)sched::cpu::current()->id){
-              buffer->vma->file->poll(retry->reqs);
-            } else {
-              buffer->vma->file->poll_on_cpu(retry->reqs, pf_cpu);
-            }
-            s64 ready_at = retry->ready_at_ns;
-            delete retry;
+            s64 ready_at = drainClaimedPrefetch(buffer, retry);
 
             simWaitUntil(ready_at);
 
