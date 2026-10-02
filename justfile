@@ -156,10 +156,11 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
 #   just build-duckdb              # release build with LTO
 #   just build-duckdb release 0    # disable LTO (faster rebuild for debugging)
 #   just build-duckdb release 1 1  # keep frame pointers (profilable DuckDB frames)
+#   just build-duckdb release 1 0 0  # eviction by sweep over dir->pages instead of the page resident set
 #
-# Parameters are positional (mode lto fp) - `lto=0` is read as mode, not as lto.
+# Parameters are positional (mode lto fp page_rs) - `lto=0` is read as mode, not as lto.
 #
-build-duckdb mode="release" lto="1" fp="0":
+build-duckdb mode="release" lto="1" fp="0" page_rs="1":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -209,13 +210,17 @@ build-duckdb mode="release" lto="1" fp="0":
     parquet_lib="${duckdb_build}/extension/parquet/libparquet_extension.a"
     ext_loader_lib="${duckdb_build}/extension/libduckdb_generated_extension_loader.a"
 
+    # make doesn't track the DUCKDB_PAGE_RS flag, so rebuild the objects that read it.
+    rm -f build/{{mode}}.x64/benchmarks/duckdb/osv_ucache_file_system.o \
+          build/{{mode}}.x64/benchmarks/duckdb/osv_page_resident_set.o
+
     make -j$(nproc) \
         mode={{mode}} \
         lto={{lto}} \
         fs=ext \
-        APP_OBJECTS="benchmarks/duckdb/duckdb_app.o benchmarks/duckdb/osv_ucache_file_system.o" \
+        APP_OBJECTS="benchmarks/duckdb/duckdb_app.o benchmarks/duckdb/osv_ucache_file_system.o benchmarks/duckdb/osv_page_resident_set.o" \
         APP_LIBS="${duckdb_lib} ${core_fn_lib} ${parquet_lib} ${ext_loader_lib}" \
-        EXTRA_CXXFLAGS="-I${duckdb_src}/src/include -I${duckdb_src}/third_party/concurrentqueue -I${duckdb_src}/extension/parquet/include -I${duckdb_src}/third_party/thrift" \
+        EXTRA_CXXFLAGS="-I${duckdb_src}/src/include -I${duckdb_src}/third_party/concurrentqueue -I${duckdb_src}/extension/parquet/include -I${duckdb_src}/third_party/thrift -DDUCKDB_PAGE_RS={{page_rs}}" \
         app_local_exec_tls_size=2048 \
         bootfs_manifest=bootfs_ext.manifest.skel
 
