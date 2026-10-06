@@ -455,6 +455,11 @@ void io_queue_pair::process_cqe_locked(nvme_cq_entry_t* cqep)
         }
     }
 
+    // Completion hook. Runs before BIO_DONE is set, as the submitter may free the bio after that.
+    if (pending_bio->bio_done) {
+        pending_bio->bio_done(pending_bio);
+    }
+
     // Call biodone
     if (cqe.sct != 0 || cqe.sc != 0) {
         trace_nvme_req_done_error(_driver_id, _id, cid, cqe.sct, cqe.sc, pending_bio);

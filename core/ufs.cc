@@ -103,7 +103,12 @@ namespace ucache {
     }
   }
 
-  aio_req_t* local_ufile::async_io(int opc, void* addr, u64 offset, u64 r_size){
+  // bio_done of a counted request: bio_caller1 is the counter. Called by the NVMe queue.
+  static void inflight_bio_done(struct bio* bio){
+    static_cast<std::atomic<int>*>(bio->bio_caller1)->fetch_sub(1, std::memory_order_relaxed);
+  }
+
+  aio_req_t* local_ufile::async_io(int opc, void* addr, u64 offset, u64 r_size, std::atomic<int>* inflight){
     assert_crash(r_size % ext4_block_size == 0); // make sure its 4KiB aligned
     u64 nb_blocks = r_size / ext4_block_size;
     u64 blocks[nb_blocks];
@@ -130,6 +135,11 @@ namespace ucache {
             bio->bio_offset = blocks[run_start] * ext4_block_size;
             bio->bio_bcount = run_blocks * ext4_block_size;
             bio->bio_data   = (char*)addr + run_start * ext4_block_size;
+            if (inflight) {
+                inflight->fetch_add(1, std::memory_order_relaxed);
+                bio->bio_caller1 = inflight;
+                bio->bio_done = inflight_bio_done;
+            }
             fs->devices[0]->make_async_request(bio);
             reqs->bios[bio_idx++] = bio;
             run_start = i;
@@ -160,8 +170,8 @@ namespace ucache {
     poll_reqs(reqs);
   }
 
-  aio_req_t* local_ufile::aread(void* addr, u64 offset, u64 r_size, bool ring){
-    return async_io(BIO_READ, addr, offset, r_size);
+  aio_req_t* local_ufile::aread(void* addr, u64 offset, u64 r_size, bool ring, std::atomic<int>* inflight){
+    return async_io(BIO_READ, addr, offset, r_size, inflight);
   }
 
   aio_req_t* local_ufile::awrite(void* addr, u64 offset, u64 r_size, bool ring){

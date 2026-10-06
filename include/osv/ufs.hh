@@ -67,7 +67,9 @@ namespace ucache {
       ufile(ufs*);
       virtual void read(void* buf, u64 offset, u64 size)  = 0;
       virtual void write(void* buf, u64 offset, u64 size) = 0;
-      virtual aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring) = 0;
+      // inflight, if given, is incremented per request issued and decremented when the device
+      // completes it, whether or not anyone waits on the request.
+      virtual aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring, std::atomic<int>* inflight = nullptr) = 0;
       virtual aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring) = 0;
       virtual void poll(aio_req_t* reqs) = 0;
       virtual void poll_on_cpu(aio_req_t* reqs, int cpu_id) = 0;
@@ -86,7 +88,7 @@ namespace ucache {
       local_ufile(const char* name, u64 req_size, ufs* fs);
       void read(void* buf, u64 offset, u64 size);
       void write(void* buf, u64 offset, u64 size);
-      aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring);
+      aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring, std::atomic<int>* inflight = nullptr);
       aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring);
       void poll(aio_req_t* reqs);
       void poll_on_cpu(aio_req_t* reqs, int cpu_id);
@@ -96,7 +98,7 @@ namespace ucache {
 
       void getLBAs(u64* blocks, u64 offset, u64 nb_blocks);
     private:
-      aio_req_t* async_io(int opc, void* addr, u64 offset, u64 size);
+      aio_req_t* async_io(int opc, void* addr, u64 offset, u64 size, std::atomic<int>* inflight = nullptr);
       void poll_reqs(aio_req_t* reqs);
   };
 

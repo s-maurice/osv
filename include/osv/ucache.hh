@@ -695,10 +695,9 @@ namespace ucache {
       ufs* fs;
 
       // Per-CPU in-flight prefetch counter.
-      // per_cpu_inflight_count[cpu_id] counts buffers whose async IO was started
-      // by that CPU and not yet completed (ReadyToInsertToCached).  Incremented
-      // by the owning CPU in prefetch(); decremented using getPrefetcher()-1 in
-      // ReadyToInsertToCached() so cross-CPU completion is handled correctly.
+      // per_cpu_inflight_count[cpu_id] counts the prefetch requests that CPU issued and the
+      // device has not completed yet. Incremented at submission, decremented when the NVMe
+      // queue sees the completion, even if no fault or eviction touches the buffer.
       // Allocated in uCache::init().
       std::atomic<int>* per_cpu_inflight_count = nullptr;
 

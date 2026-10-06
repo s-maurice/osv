@@ -332,10 +332,6 @@ namespace ucache {
     }
     bs->state = BufferState::Cached;
     vma->post_ReadyToInsertToCached_callback(vma->getBuffer(baseVirt));
-    int prefetcher_cpu = getPrefetcher() - 1;
-    if(prefetcher_cpu >= 0){
-      uCacheManager->per_cpu_inflight_count[prefetcher_cpu].fetch_sub(1, std::memory_order_relaxed);
-    }
     return true;
   }
 
@@ -772,10 +768,6 @@ namespace ucache {
     clearIO(false);
     updateSnapshot(bs);
     assert_crash(bs->state == BufferState::ReadyToInsert);
-
-    if(prefetcher_cpu >= 0){
-      uCacheManager->per_cpu_inflight_count[prefetcher_cpu].fetch_sub(1, std::memory_order_relaxed);
-    }
     return true;
   }
 
@@ -1049,13 +1041,13 @@ namespace ucache {
       }
 
       if(buf->UncachedToPrefetching(phys, bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
-        bs->reqs = vma->file->aread(buf->baseVirt, (u64)buf->baseVirt-(u64)vma->start, vma->pageSize, false);
+        bs->reqs = vma->file->aread(buf->baseVirt, (u64)buf->baseVirt-(u64)vma->start, vma->pageSize, false,
+                                    &per_cpu_inflight_count[sched::cpu::current()->id]);
         buf->snap.store(bs, std::memory_order_release);
         readSize += vma->pageSize;
         prefetch_issued_bytes += vma->pageSize;
         usedPhysSize += vma->pageSize;
         vma->usedPhysSize += vma->pageSize;
-        per_cpu_inflight_count[sched::cpu::current()->id].fetch_add(1, std::memory_order_relaxed);
         assert_crash(vma->residentSet->insert(buf));
       }else{
         // put back unused candidates
