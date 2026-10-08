@@ -33,7 +33,9 @@ run:
 # mem    — total physical memory given to the QEMU VM (default 8G)
 # cache  — bytes for OSv uCache; K/M/G suffix accepted (default: 50% of mem)
 # duckdb — DuckDB buffer pool limit; K/M/G suffix accepted (default: 80% of cache)
-run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="":
+# image_dir — folder holding loader.img and loader-stripped.elf (default: the last build;
+#             build/ablation/step<N> for an ablation step kept by build-duckdb)
+run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="" image_dir="build/last":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -76,7 +78,8 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
     # and boot16.S (which hardcodes dl=0x80) reads from the wrong disk.
     # -i loader.img: still needed so run.py doesn't fall back to usr.img (which
     # we don't build); the file is presented as a virtio-blk but not used for boot.
-    taskset -c 0-63 ./scripts/run.py -k -i build/last/loader.img \
+    taskset -c 0-63 ./scripts/run.py -k -i "{{image_dir}}/loader.img" \
+        --kernel-path "{{image_dir}}/loader-stripped.elf" \
         -m "{{mem}}" -c "{{vcpus}}" \
         -e "${osv_env}" \
         --pass-pci "0000:{{ssd_id}}"
@@ -156,11 +159,12 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
 #   just build-duckdb              # release build with LTO
 #   just build-duckdb release 0    # disable LTO (faster rebuild for debugging)
 #   just build-duckdb release 1 1  # keep frame pointers (profilable DuckDB frames)
-#   just build-duckdb release 1 0 0  # eviction by sweep over dir->pages instead of the page resident set
+#   just build-duckdb release 1 0 2  # ablation step 2 (steps: benchmarks/duckdb/osv_ablation.hpp)
 #
-# Parameters are positional (mode lto fp page_rs) - `lto=0` is read as mode, not as lto.
+# Parameters are positional (mode lto fp step) - `lto=0` is read as mode, not as lto.
+# The image of each build is also kept in build/ablation/step<N>, for run-duckdb's image_dir.
 #
-build-duckdb mode="release" lto="1" fp="0" page_rs="1":
+build-duckdb mode="release" lto="1" fp="0" step="6":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -175,6 +179,14 @@ build-duckdb mode="release" lto="1" fp="0" page_rs="1":
     fi
     if [ "{{fp}}" = "1" ]; then
         lto_flags="${lto_flags} -fno-omit-frame-pointer"
+    fi
+
+    # The ablation step is read from a generated header, by DuckDB's parquet extension and by
+    # the app objects. Only rewritten on a change, so the same step again rebuilds nothing.
+    variant_hdr="{{osv_dir}}/benchmarks/duckdb/osv_ablation_variant.hpp"
+    variant_def="#define DUCKDB_ABLATION_STEP {{step}}"
+    if [ "$(cat "${variant_hdr}" 2>/dev/null)" != "${variant_def}" ]; then
+        echo "${variant_def}" > "${variant_hdr}"
     fi
 
     # --- Step 1: build DuckDB static library ---
@@ -210,7 +222,7 @@ build-duckdb mode="release" lto="1" fp="0" page_rs="1":
     parquet_lib="${duckdb_build}/extension/parquet/libparquet_extension.a"
     ext_loader_lib="${duckdb_build}/extension/libduckdb_generated_extension_loader.a"
 
-    # make doesn't track the DUCKDB_PAGE_RS flag, so rebuild the objects that read it.
+    # Rebuild the objects that read the ablation step.
     rm -f build/{{mode}}.x64/benchmarks/duckdb/osv_ucache_file_system.o \
           build/{{mode}}.x64/benchmarks/duckdb/osv_page_resident_set.o
 
@@ -220,9 +232,13 @@ build-duckdb mode="release" lto="1" fp="0" page_rs="1":
         fs=ext \
         APP_OBJECTS="benchmarks/duckdb/duckdb_app.o benchmarks/duckdb/osv_ucache_file_system.o benchmarks/duckdb/osv_page_resident_set.o" \
         APP_LIBS="${duckdb_lib} ${core_fn_lib} ${parquet_lib} ${ext_loader_lib}" \
-        EXTRA_CXXFLAGS="-I${duckdb_src}/src/include -I${duckdb_src}/third_party/concurrentqueue -I${duckdb_src}/extension/parquet/include -I${duckdb_src}/third_party/thrift -DDUCKDB_PAGE_RS={{page_rs}}" \
+        EXTRA_CXXFLAGS="-I${duckdb_src}/src/include -I${duckdb_src}/third_party/concurrentqueue -I${duckdb_src}/extension/parquet/include -I${duckdb_src}/third_party/thrift" \
         app_local_exec_tls_size=2048 \
         bootfs_manifest=bootfs_ext.manifest.skel
+
+    # Keep this step's image, so several steps can be run without rebuilding.
+    mkdir -p build/ablation/step{{step}}
+    cp build/{{mode}}.x64/loader.img build/{{mode}}.x64/loader-stripped.elf build/ablation/step{{step}}/
 
 bind-ssd-vfio:
     #!/usr/bin/env bash
