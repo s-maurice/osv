@@ -160,11 +160,13 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
 #   just build-duckdb release 0    # disable LTO (faster rebuild for debugging)
 #   just build-duckdb release 1 1  # keep frame pointers (profilable DuckDB frames)
 #   just build-duckdb release 1 0 2  # ablation step 2 (steps: benchmarks/duckdb/osv_ablation.hpp)
+#   just build-duckdb release 1 0 6 1  # step 6 with the TLB shootdown IPIs back on
 #
-# Parameters are positional (mode lto fp step) - `lto=0` is read as mode, not as lto.
-# The image of each build is also kept in build/ablation/step<N>, for run-duckdb's image_dir.
+# Parameters are positional (mode lto fp step ipi) - `lto=0` is read as mode, not as lto.
+# The image of each build is also kept in build/ablation/step<N> (step<N>_ipi with ipi=1),
+# for run-duckdb's image_dir.
 #
-build-duckdb mode="release" lto="1" fp="0" step="6":
+build-duckdb mode="release" lto="1" fp="0" step="6" ipi="0":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -185,6 +187,12 @@ build-duckdb mode="release" lto="1" fp="0" step="6":
     # the app objects. Only rewritten on a change, so the same step again rebuilds nothing.
     variant_hdr="{{osv_dir}}/benchmarks/duckdb/osv_ablation_variant.hpp"
     variant_def="#define DUCKDB_ABLATION_STEP {{step}}"
+    image_dir="build/ablation/step{{step}}"
+    # ipi=1 overrides the step's default, to measure the shootdown alone.
+    if [ "{{ipi}}" = "1" ]; then
+        variant_def="${variant_def}"$'\n'"#define DUCKDB_NO_TLB_SHOOTDOWN 0"
+        image_dir="${image_dir}_ipi"
+    fi
     if [ "$(cat "${variant_hdr}" 2>/dev/null)" != "${variant_def}" ]; then
         echo "${variant_def}" > "${variant_hdr}"
     fi
@@ -237,8 +245,8 @@ build-duckdb mode="release" lto="1" fp="0" step="6":
         bootfs_manifest=bootfs_ext.manifest.skel
 
     # Keep this step's image, so several steps can be run without rebuilding.
-    mkdir -p build/ablation/step{{step}}
-    cp build/{{mode}}.x64/loader.img build/{{mode}}.x64/loader-stripped.elf build/ablation/step{{step}}/
+    mkdir -p "${image_dir}"
+    cp build/{{mode}}.x64/loader.img build/{{mode}}.x64/loader-stripped.elf "${image_dir}/"
 
 bind-ssd-vfio:
     #!/usr/bin/env bash
