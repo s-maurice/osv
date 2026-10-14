@@ -134,13 +134,14 @@ void queue_pair::map_prps(nvme_sq_entry_t* cmd, struct bio* bio, u64 datasize)
     if (ucache::uCacheManager != NULL) {
         ucache::VMA *vma = ucache::uCacheManager->getVMA(bio->bio_data);
         if (vma != NULL) {
-            // Compute byte offset of bio->bio_data within its VMA page.
-            // For 4 KiB pages vma->pageSize == NVME_PAGESIZE so off == 0.
-            // For 2 MiB huge pages the bio covers one 4 KiB slice of the page.
-            u64 off = (u64)bio->bio_data & (vma->pageSize - 1);
-            ucache::PTE pte = (vma->pageSize == mmu::huge_page_size)
-                              ? ucache::walkHuge(bio->bio_data)
-                              : ucache::walk(bio->bio_data);
+            // A 2 MiB page has one PTE for the whole page, so the offset is
+            // within the huge page. Smaller pages have one PTE per 4 KiB slice
+            // whose phys already points at that slice, so the offset is
+            // within the slice.
+            bool huge = vma->pageSize == mmu::huge_page_size;
+            u64 off = (u64)bio->bio_data & ((huge ? vma->pageSize : mmu::page_size) - 1);
+            ucache::PTE pte = huge ? ucache::walkHuge(bio->bio_data)
+                                   : ucache::walk(bio->bio_data);
             addr = (pte.phys << 12) + off;
         } else {
             addr = (u64)mmu::virt_to_phys(bio->bio_data);
