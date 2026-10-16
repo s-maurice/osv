@@ -36,7 +36,8 @@ run:
 # image_dir — folder holding loader.img and loader-stripped.elf (default: the last build;
 #             build/ablation/step<N> for an ablation step kept by build-duckdb)
 # cpuset — host CPUs QEMU is pinned to (taskset -c list, default 0-63)
-run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="" image_dir="build/last" cpuset="0-63":
+# qemu_args — extra arguments for QEMU itself, e.g. "-name osv,debug-threads=on"
+run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="" image_dir="build/last" cpuset="0-63" qemu_args="":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -73,6 +74,11 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
     if [ -n "{{sim_bw_gbps}}" ]; then
         osv_env="${osv_env} --env=UCACHE_SIM_BW_GBPS={{sim_bw_gbps}}"
     fi
+    # --pass-args=: with a space, argparse takes a value starting with "-" for an option.
+    pass_args=()
+    if [ -n "{{qemu_args}}" ]; then
+        pass_args=("--pass-args={{qemu_args}}")
+    fi
 
     # -k: PVH kernel mode — QEMU loads loader-stripped.elf directly, bypassing
     # BIOS INT 13h.  Without this, SeaBIOS may give the VFIO NVMe drive 0x80
@@ -83,7 +89,7 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
         --kernel-path "{{image_dir}}/loader-stripped.elf" \
         -m "{{mem}}" -c "{{vcpus}}" \
         -e "${osv_env}" \
-        --pass-pci "0000:{{ssd_id}}"
+        --pass-pci "0000:{{ssd_id}}" "${pass_args[@]}"
 
 # Sample one TPC-H repetition with OSv's sampler and pull the profile over the gdb stub.
 # hz x seconds sampled must stay under ~7.7k samples per CPU (1 MiB trace ring); 100 Hz covers ~75 s.
