@@ -87,10 +87,15 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
 
 # Sample one TPC-H repetition with OSv's sampler and pull the profile over the gdb stub.
 # hz x seconds sampled must stay under ~7.7k samples per CPU (1 MiB trace ring); 100 Hz covers ~75 s.
-profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" hz="100" rep="" out="traces.bin" wait_s="1800" cpuset="0-63":
+profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" hz="100" rep="" out="traces.bin" wait_s="1800" cpuset="0-63" image_dir="build/last":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
+    # gdb auto-loads scripts/loader.py via the ELF's .debug_gdb_scripts section, but
+    # doesn't add that script's own directory to sys.path the way `python3 script.py`
+    # does, so its `from osv.trace import ...` fails unless scripts/ is already on
+    # PYTHONPATH.
+    export PYTHONPATH="{{osv_dir}}/scripts${PYTHONPATH:+:$PYTHONPATH}"
 
     current_driver=$(sudo driverctl list-devices | grep "{{ssd_id}}" | awk '{print $2}')
     if [ "${current_driver}" != "vfio-pci" ]; then
@@ -121,7 +126,8 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
     log="${out%.bin}.log"
 
     # </dev/null: a backgrounded QEMU that touches the tty stops dead on SIGTTIN/SIGTTOU.
-    taskset -c "{{cpuset}}" ./scripts/run.py -k -i build/last/loader.img \
+    taskset -c "{{cpuset}}" ./scripts/run.py -k -i "{{image_dir}}/loader.img" \
+        --kernel-path "{{image_dir}}/loader-stripped.elf" \
         -m "{{mem}}" -c "{{vcpus}}" \
         -H -e "${osv_env}" \
         --pass-pci "0000:{{ssd_id}}" > "${log}" 2>&1 < /dev/null &
@@ -142,9 +148,9 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
 
     # The ring is frozen, so this is not a race; `monitor quit` then shuts the VM down.
     tail -n 3 "${log}"
-    python3 scripts/trace.py extract -e build/last/loader.elf -r localhost:1234 "${out}"
-    python3 scripts/trace.py prof -e build/last/loader.elf -S "${out}" > "${out%.bin}.prof"
-    gdb build/last/loader.elf -batch -ex 'target remote localhost:1234' -ex 'monitor quit' >/dev/null 2>&1 || true
+    python3 scripts/trace.py extract -e "{{image_dir}}/loader.elf" -r localhost:1234 "${out}"
+    python3 scripts/trace.py prof -e "{{image_dir}}/loader.elf" -S "${out}" > "${out%.bin}.prof"
+    gdb "{{image_dir}}/loader.elf" -batch -ex 'target remote localhost:1234' -ex 'monitor quit' >/dev/null 2>&1 || true
     echo "==> ${out}  +  ${out%.bin}.prof"
     head -n 40 "${out%.bin}.prof"
 
@@ -246,8 +252,10 @@ build-duckdb mode="release" lto="1" fp="0" step="6" ipi="0":
         bootfs_manifest=bootfs_ext.manifest.skel
 
     # Keep this step's image, so several steps can be run without rebuilding.
+    # loader.elf (unstripped) is kept too, for profile-duckdb's symbol resolution.
     mkdir -p "${image_dir}"
-    cp build/{{mode}}.x64/loader.img build/{{mode}}.x64/loader-stripped.elf "${image_dir}/"
+    cp build/{{mode}}.x64/loader.img build/{{mode}}.x64/loader-stripped.elf \
+       build/{{mode}}.x64/loader.elf "${image_dir}/"
 
 bind-ssd-vfio:
     #!/usr/bin/env bash
