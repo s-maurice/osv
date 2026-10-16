@@ -35,7 +35,8 @@ run:
 # duckdb — DuckDB buffer pool limit; K/M/G suffix accepted (default: 80% of cache)
 # image_dir — folder holding loader.img and loader-stripped.elf (default: the last build;
 #             build/ablation/step<N> for an ablation step kept by build-duckdb)
-run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="" image_dir="build/last":
+# cpuset — host CPUs QEMU is pinned to (taskset -c list, default 0-63)
+run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" print="" sim_latency_us="" sim_bw_gbps="" image_dir="build/last" cpuset="0-63":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -78,7 +79,7 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
     # and boot16.S (which hardcodes dl=0x80) reads from the wrong disk.
     # -i loader.img: still needed so run.py doesn't fall back to usr.img (which
     # we don't build); the file is presented as a virtio-blk but not used for boot.
-    taskset -c 0-63 ./scripts/run.py -k -i "{{image_dir}}/loader.img" \
+    taskset -c "{{cpuset}}" ./scripts/run.py -k -i "{{image_dir}}/loader.img" \
         --kernel-path "{{image_dir}}/loader-stripped.elf" \
         -m "{{mem}}" -c "{{vcpus}}" \
         -e "${osv_env}" \
@@ -86,7 +87,7 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
 
 # Sample one TPC-H repetition with OSv's sampler and pull the profile over the gdb stub.
 # hz x seconds sampled must stay under ~7.7k samples per CPU (1 MiB trace ring); 100 Hz covers ~75 s.
-profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" hz="100" rep="" out="traces.bin" wait_s="1800":
+profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batch="" prefetch_batch="" hz="100" rep="" out="traces.bin" wait_s="1800" cpuset="0-63":
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{osv_dir}}
@@ -120,7 +121,7 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
     log="${out%.bin}.log"
 
     # </dev/null: a backgrounded QEMU that touches the tty stops dead on SIGTTIN/SIGTTOU.
-    taskset -c 0-63 ./scripts/run.py -k -i build/last/loader.img \
+    taskset -c "{{cpuset}}" ./scripts/run.py -k -i build/last/loader.img \
         -m "{{mem}}" -c "{{vcpus}}" \
         -H -e "${osv_env}" \
         --pass-pci "0000:{{ssd_id}}" > "${log}" 2>&1 < /dev/null &
