@@ -174,11 +174,11 @@ profile-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_
 #   just build-duckdb release 1 1  # keep frame pointers (profilable DuckDB frames)
 #   just build-duckdb release 1 0 2  # ablation step 2 (steps: benchmarks/duckdb/osv_ablation.hpp)
 #   just build-duckdb release 1 0 6 1  # step 6 with the TLB shootdown IPIs back on
-#   just build-duckdb release 1 0 6 0 1  # step 6 keeping each page's header frame resident
+#   just build-duckdb release 1 0 6 0 5  # step 6 keeping the first 5 frames of each page resident
 #
 # Parameters are positional (mode lto fp step ipi hdr) - `lto=0` is read as mode, not as lto.
 # The image of each build is also kept in build/ablation/step<N> (suffixed _ipi with ipi=1,
-# _hdr with hdr=1), for run-duckdb's image_dir.
+# _hdr<hdr> with hdr>0), for run-duckdb's image_dir.
 #
 build-duckdb mode="release" lto="1" fp="0" step="6" ipi="0" hdr="0":
     #!/usr/bin/env bash
@@ -207,10 +207,11 @@ build-duckdb mode="release" lto="1" fp="0" step="6" ipi="0" hdr="0":
         variant_def="${variant_def}"$'\n'"#define DUCKDB_NO_TLB_SHOOTDOWN 0"
         image_dir="${image_dir}_ipi"
     fi
-    # hdr=1 keeps the frame holding each page's header resident, see osv_ablation.hpp.
-    if [ "{{hdr}}" = "1" ]; then
-        variant_def="${variant_def}"$'\n'"#define DUCKDB_KEEP_HEADER_FRAMES 1"
-        image_dir="${image_dir}_hdr"
+    # hdr=N keeps the first N frames of each page resident, the first holding its header, see
+    # osv_ablation.hpp.
+    if [ "{{hdr}}" != "0" ]; then
+        variant_def="${variant_def}"$'\n'"#define DUCKDB_KEEP_HEADER_FRAMES {{hdr}}"
+        image_dir="${image_dir}_hdr{{hdr}}"
     fi
     if [ "$(cat "${variant_hdr}" 2>/dev/null)" != "${variant_def}" ]; then
         echo "${variant_def}" > "${variant_hdr}"
